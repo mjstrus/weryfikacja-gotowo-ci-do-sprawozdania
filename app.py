@@ -19,6 +19,7 @@ from symfonia_year_end_auditor import (
     SymfoniaYearEndAuditor,
     DaneZOiS,
     DaneBilansu,
+    DaneRZiS,
     WyciagBankowy,
     MIESIACE_PL,
     normalize_currency,
@@ -193,7 +194,7 @@ st.markdown("""
     <div class="abacus-logo">📊</div>
     <div class="abacus-title-block">
         <h1>Kontrola Jakości – Zamknięcie Roku Obrachunkowego</h1>
-        <p>Abacus Centrum Księgowe Puławy &nbsp;·&nbsp; ZOiS · Bilans · Wyciągi Bankowe</p>
+        <p>Abacus Centrum Księgowe Puławy &nbsp;·&nbsp; ZOiS · Bilans · RZiS · Wyciągi Bankowe</p>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -205,7 +206,7 @@ st.markdown("""
 
 def reset_state():
     """Reset wszystkich danych audytu."""
-    for k in ["dane_zois", "dane_bilans", "konta_bankowe",
+    for k in ["dane_zois", "dane_bilans", "dane_rzis", "konta_bankowe",
               "wyciagi", "raport", "etap"]:
         if k in st.session_state:
             del st.session_state[k]
@@ -320,21 +321,32 @@ if st.session_state["etap"] == 1:
 
     with col1:
         st.markdown("""
-        **Pierwszy krok:** Wgraj plik ZOiS z Symfonii. System wykryje wszystkie
-        rachunki bankowe (analityki konta 130) i pozwoli uzupełnić wyciągi do każdego
-        z nich z osobna.
+        **Wgraj sprawozdania finansowe z Symfonii:**
+
+        1. **ZOiS** – Zestawienie Obrotów i Sald (wymagane)
+        2. **Bilans** – struktura aktywów/pasywów + wynik netto
+        3. **RZiS** – Rachunek Zysków i Strat (wariant porównawczy)
+
+        System porówna je krzyżowo i wykryje wszystkie rachunki bankowe
+        (analityki konta 130) do uzupełnienia w następnym kroku.
         """)
 
         plik_zois = st.file_uploader(
-            "Zestawienie Obrotów i Sald (XLSX lub PDF)",
+            "📋 Zestawienie Obrotów i Sald (XLSX lub PDF)",
             type=["xlsx", "xls", "pdf"],
             key="upload_zois",
         )
 
         plik_bilans = st.file_uploader(
-            "Bilans (XLSX lub PDF) – opcjonalnie",
+            "📊 Bilans (XLSX lub PDF)",
             type=["xlsx", "xls", "pdf"],
             key="upload_bilans",
+        )
+
+        plik_rzis = st.file_uploader(
+            "📈 Rachunek Zysków i Strat (XLSX lub PDF)",
+            type=["xlsx", "xls", "pdf"],
+            key="upload_rzis",
         )
 
         tryb_testowy = st.checkbox(
@@ -343,7 +355,7 @@ if st.session_state["etap"] == 1:
         )
 
         if st.button(
-            "🔍 Analizuj ZOiS →",
+            "🔍 Analizuj sprawozdania →",
             type="primary",
             use_container_width=True,
             disabled=(not tryb_testowy and plik_zois is None),
@@ -374,8 +386,22 @@ if st.session_state["etap"] == 1:
                     }
                     st.session_state["dane_zois"] = dz
                     st.session_state["dane_bilans"] = DaneBilansu(
-                        aktywa_biezacy=Decimal("350000.00"),
-                        pasywa_biezacy=Decimal("350000.00"),
+                        aktywa_trwale_biezacy=Decimal("50000.00"),
+                        aktywa_obrotowe_biezacy=Decimal("300000.00"),
+                        kapital_wlasny_biezacy=Decimal("140000.00"),
+                        zobowiazania_biezacy=Decimal("210000.00"),
+                        suma_aktywow_biezacy=Decimal("350000.00"),
+                        suma_pasywow_biezacy=Decimal("350000.00"),
+                        wynik_netto_biezacy=Decimal("45000.00"),
+                    )
+                    st.session_state["dane_rzis"] = DaneRZiS(
+                        przychody_sprzedazy=(Decimal("210000.00"), Decimal("180000.00")),
+                        koszty_operacyjne=(Decimal("145000.00"), Decimal("120000.00")),
+                        zysk_sprzedazy=(Decimal("65000.00"), Decimal("60000.00")),
+                        zysk_dzialalnosci_oper=(Decimal("65000.00"), Decimal("60000.00")),
+                        zysk_brutto=(Decimal("65000.00"), Decimal("60000.00")),
+                        podatek_dochodowy=(Decimal("20000.00"), Decimal("15000.00")),
+                        zysk_netto=(Decimal("45000.00"), Decimal("45000.00")),
                     )
                     st.session_state["tryb_testowy"] = True
                 else:
@@ -384,11 +410,19 @@ if st.session_state["etap"] == 1:
                     st.session_state["dane_zois"] = dz
                     st.session_state["tryb_testowy"] = False
 
+                    # Bilans (opcjonalnie)
                     if plik_bilans:
                         db = audytor.parsuj_bilans(plik_bilans.read(), pobierz_format(plik_bilans))
                         st.session_state["dane_bilans"] = db
                     else:
                         st.session_state["dane_bilans"] = None
+
+                    # RZiS (opcjonalnie)
+                    if plik_rzis:
+                        dr = audytor.parsuj_rzis(plik_rzis.read(), pobierz_format(plik_rzis))
+                        st.session_state["dane_rzis"] = dr
+                    else:
+                        st.session_state["dane_rzis"] = None
 
                 # Wykrycie rachunków
                 st.session_state["konta_bankowe"] = dz.pobierz_konta_bankowe()
@@ -405,12 +439,13 @@ if st.session_state["etap"] == 1:
                 💡 Co robi ten etap?
             </div>
             <div style="font-size:0.82rem; color:#4b5563; line-height:1.5;">
-                System parsuje ZOiS i agreguje konta z podziałem na:
+                System przetwarza trzy sprawozdania:
                 <ul style="margin:8px 0 0 0; padding-left:18px;">
-                    <li>Syntetyki (np. konto 400)</li>
-                    <li>Analityki (np. 130-1, 130-2, 130-3)</li>
+                    <li><strong>ZOiS</strong> → konta syntetyczne + analityki (130-X)</li>
+                    <li><strong>Bilans</strong> → aktywa, pasywa, wynik netto</li>
+                    <li><strong>RZiS</strong> → pozycje A-L (wariant porównawczy)</li>
                 </ul>
-                Konto 130 rozbije na wszystkie rachunki bankowe.
+                Po przetworzeniu przejdziemy do etapu wyciągów bankowych.
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -602,6 +637,7 @@ elif st.session_state["etap"] == 2:
                 wyniki = audytor.check_accounting_logic(
                     dane_zois=st.session_state["dane_zois"],
                     dane_bilans=st.session_state.get("dane_bilans"),
+                    dane_rzis=st.session_state.get("dane_rzis"),
                     wyciagi=list(wyciagi_dict.values()),
                     rok_obrachunkowy=st.session_state["rok"],
                 )
