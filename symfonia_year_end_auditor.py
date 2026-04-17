@@ -342,35 +342,113 @@ class ParserZOiS:
                 return i
         return None
 
+    # Regex do rozpoznawania wierszy w tekstowej wersji PDF Symfonii
+    RE_NUMER_KONTA = re.compile(r"^(\d{2,3}(?:-\d+)*)\s+(.*)$")
+    RE_LICZBA_PL = re.compile(r"-?\d+(?:\.\d{3})*,\d{1,2}")
+    LINIE_IGNOROWANE = (
+        "Suma strony", "Suma razem", "Z przeniesienia", "Do przeniesienia",
+    )
+
     def parsuj_pdf(self, dane_binarne: bytes) -> DaneZOiS:
+        """
+        Parser PDF ZOiS z Symfonii.
+        Symfonia eksportuje PDF jako tekst w kolumnach (bez obramowań tabeli),
+        więc używamy ekstraktu tekstu + regex zamiast extract_tables().
+
+        Strategia:
+          1. Iteruj po liniach - każda potencjalnie to wiersz kontowy
+          2. Wiersz zaczyna się od numeru konta (np. 130, 201-5, 403-1-1)
+          3. Długie nazwy klientów mogą być wieloliniowe - obsługa przenoszenia
+          4. Z końca linii bierzemy 8 liczb (BO Wn, BO Ma, obroty Wn/Ma,
+             narast Wn/Ma, Saldo Wn, Saldo Ma) - interesują nas 2 ostatnie
+        """
         if not PDF_AVAILABLE:
             raise ImportError("Brak biblioteki pdfplumber.")
         bufor = io.BytesIO(dane_binarne)
-        wiersze = []
-        naglowki = None
+        linie = []
         with pdfplumber.open(bufor) as pdf:
             for strona in pdf.pages:
-                tabele = strona.extract_tables(table_settings={
-                    "vertical_strategy": "lines",
-                    "horizontal_strategy": "lines",
-                    "snap_tolerance": 3,
-                })
-                for tabela in tabele or []:
-                    for w in tabela or []:
-                        if w is None:
-                            continue
-                        vals = [str(v or "").strip() for v in w]
-                        if naglowki is None:
-                            wl = {v.lower() for v in vals}
-                            if len(wl & {"konto", "saldo", "wn", "ma"}) >= 2:
-                                naglowki = vals
-                                continue
-                        if naglowki is not None and any(vals):
-                            wiersze.append(vals)
-        if naglowki is None or not wiersze:
-            raise ValueError("Nie znaleziono tabeli ZOiS w PDF.")
-        df = pd.DataFrame(wiersze, columns=naglowki)
-        return self._parsuj_dataframe(df, "PDF")
+                t = strona.extract_text() or ""
+                linie.extend(t.splitlines())
+
+        if not linie:
+            raise ValueError("PDF jest pusty lub nie udało się ekstraktować tekstu.")
+
+        wynik = DaneZOiS()
+        czek_konto: Optional[str] = None
+        czek_nazwa: str = ""
+
+        def zapisz(numer: str, nazwa: str, saldo_wn: str, saldo_ma: str):
+            """Zapisuje pozycję do DaneZOiS - do syntetyk i/lub analityk."""
+            try:
+                wn = normalize_currency(saldo_wn)
+                ma = normalize_currency(saldo_ma)
+            except ValueError:
+                return
+            numer_syn = normalize_konto(numer)
+            if not re.match(r"^\d+$", numer_syn):
+                return
+
+            # Zapis jako analityka jeśli numer zawiera "-"
+            if numer != numer_syn:
+                wynik.konta_analityki[numer] = (wn, ma)
+                if nazwa and numer not in wynik.opisy:
+                    wynik.opisy[numer] = nazwa.strip()
+            else:
+                # Czysta syntetyka
+                wynik.konta[numer_syn] = (wn, ma)
+                if nazwa and numer_syn not in wynik.opisy:
+                    wynik.opisy[numer_syn] = nazwa.strip()
+                # Dla kompatybilności wstecznej z audytorem: zapisz też do konta
+                # (syntetyki występują w ZOiS tylko raz, więc nie nadpisujemy)
+
+        for linia in linie:
+            ln = linia.strip()
+            if not ln:
+                continue
+            # Pomijamy linie podsumowujące
+            if any(x in ln for x in self.LINIE_IGNOROWANE):
+                continue
+
+            m = self.RE_NUMER_KONTA.match(ln)
+            if m:
+                numer = m.group(1)
+                reszta = m.group(2)
+                liczby = self.RE_LICZBA_PL.findall(reszta)
+
+                if len(liczby) >= 8:
+                    # Cały wiersz w jednej linii
+                    idx = reszta.find(liczby[0])
+                    nazwa = reszta[:idx].strip() if idx > 0 else ""
+                    zapisz(numer, nazwa, liczby[-2], liczby[-1])
+                    czek_konto = None
+                    czek_nazwa = ""
+                else:
+                    # Wiersz kontynuacyjny - nazwa/liczby w kolejnych liniach
+                    czek_konto = numer
+                    czek_nazwa = reszta
+            elif czek_konto:
+                liczby = self.RE_LICZBA_PL.findall(ln)
+                if len(liczby) >= 8:
+                    # Linia z liczbami dla oczekującego konta
+                    zapisz(czek_konto, czek_nazwa, liczby[-2], liczby[-1])
+                    czek_konto = None
+                    czek_nazwa = ""
+                else:
+                    # Kontynuacja nazwy klienta
+                    czek_nazwa += " " + ln
+
+        # Dla kompatybilności: jeśli mamy syntetykę 130 ale nie analitykę, dodaj ją
+        if "130" in wynik.konta and not any(
+            normalize_konto(k) == "130" for k in wynik.konta_analityki
+        ):
+            wynik.konta_analityki["130"] = wynik.konta["130"]
+
+        logger.info(
+            f"ZOiS (PDF): {len(wynik.konta)} syntetyk, "
+            f"{len(wynik.konta_analityki)} analityk."
+        )
+        return wynik
 
     def _parsuj_dataframe(self, df: pd.DataFrame, zrodlo: str) -> DaneZOiS:
         kol_konto = self._znajdz_kolumne(df, self.KOLUMNY_KONTO)
@@ -1141,29 +1219,47 @@ class SymfoniaYearEndAuditor:
             ))
 
     def _weryfikuj_konto_700(self, dane_zois):
-        s = self._saldo(dane_zois, "700")
-        if s is None:
+        """
+        Weryfikuje konta grupy 70 (przychody ze sprzedaży: 700-709).
+        W praktyce podmioty używają różnych numerów: 700 (Sprzedaż), 701, 702
+        (Sprzedaż usług), 703 (Sprzedaż towarów) itp.
+        """
+        # Sumuj wszystkie konta z grupy 70x (700-709)
+        konta_70 = {
+            k: v for k, v in dane_zois.konta.items()
+            if k.isdigit() and len(k) == 3 and k.startswith("70")
+        }
+        if not konta_70:
             self._wyniki.append(PunktKontroli(
-                konto="700", punkt="Przychody",
-                status=StatusAudytu.BRAK, uwagi="CRITICAL: Brak konta 700.",
+                konto="70x", punkt="Przychody ze sprzedaży",
+                status=StatusAudytu.BRAK,
+                uwagi="CRITICAL: Brak kont grupy 70x (700-709).",
             )); return
-        wn, ma = s
-        if wn > Decimal("0"):
+
+        suma_wn = sum((wn for wn, _ in konta_70.values()), Decimal("0"))
+        suma_ma = sum((ma for _, ma in konta_70.values()), Decimal("0"))
+        konta_str = ", ".join(sorted(konta_70.keys()))
+
+        if suma_wn > Decimal("0"):
+            bledne = [k for k, (wn, _) in konta_70.items() if wn > Decimal("0")]
             self._wyniki.append(PunktKontroli(
-                konto="700", punkt="Przychody – przychodowość",
+                konto="70x", punkt="Przychody ze sprzedaży – strona salda",
                 status=StatusAudytu.BLAD,
-                uwagi=f"Saldo Wn={wn:,.2f} zł – BŁĄD! Konto wynikowe (Ma).",
+                uwagi=f"Saldo Wn={suma_wn:,.2f} zł – BŁĄD! "
+                      f"Konta wynikowe Ma. Błędne konta: {', '.join(bledne)}.",
             ))
-        elif ma > Decimal("0"):
+        elif suma_ma > Decimal("0"):
             self._wyniki.append(PunktKontroli(
-                konto="700", punkt="Przychody – przychodowość",
+                konto="70x", punkt=f"Przychody ze sprzedaży ({konta_str})",
                 status=StatusAudytu.OK,
-                uwagi=f"Saldo Ma={ma:,.2f} zł – poprawne.",
+                uwagi=f"Saldo Ma={suma_ma:,.2f} zł – poprawne.",
+                wartosc=f"{suma_ma:,.2f} zł",
             ))
         else:
             self._wyniki.append(PunktKontroli(
-                konto="700", punkt="Przychody – przychodowość",
-                status=StatusAudytu.OSTRZEZ, uwagi="Zerowe obroty – brak sprzedaży?",
+                konto="70x", punkt="Przychody ze sprzedaży",
+                status=StatusAudytu.OSTRZEZ,
+                uwagi="Zerowe salda – brak sprzedaży w okresie?",
             ))
 
     def _weryfikuj_grupe_4(self, dane_zois):
@@ -1375,29 +1471,32 @@ class SymfoniaYearEndAuditor:
                                f"Bilans={zn_bil:,.2f} zł | Δ={roznica:,.2f} zł."),
                     ))
 
-        # 2. Konto 700 ≈ RZiS poz. A (Przychody ze sprzedaży)
+        # 2. Grupa 70x (Ma) ≈ RZiS poz. A (Przychody ze sprzedaży)
         if dane_zois is not None and dane_rzis is not None:
-            s700 = dane_zois.konta.get("700")
-            if s700:
-                _, saldo_700_ma = s700
+            konta_70 = {
+                k: v for k, v in dane_zois.konta.items()
+                if k.isdigit() and len(k) == 3 and k.startswith("70")
+            }
+            if konta_70:
+                suma_70_ma = sum((ma for _, ma in konta_70.values()), Decimal("0"))
                 przych = dane_rzis.przychody_sprzedazy[0]
-                if przych > Decimal("0"):
-                    roznica = abs(saldo_700_ma - przych)
+                konta_str = "+".join(sorted(konta_70.keys()))
+                if przych > Decimal("0") and suma_70_ma > Decimal("0"):
+                    roznica = abs(suma_70_ma - przych)
                     if roznica <= TOL:
                         self._wyniki.append(PunktKontroli(
                             konto="ZOiS↔RZiS",
-                            punkt="Konto 700 (Ma) ≈ RZiS poz. A (Przychody)",
+                            punkt=f"Grupa 70x (Ma) ≈ RZiS poz. A (Przychody)",
                             status=StatusAudytu.OK,
-                            uwagi=f"Przychody zgodne: {saldo_700_ma:,.2f} zł.",
+                            uwagi=f"Przychody zgodne ({konta_str}): {suma_70_ma:,.2f} zł.",
                         ))
                     else:
                         self._wyniki.append(PunktKontroli(
                             konto="ZOiS↔RZiS",
-                            punkt="Konto 700 (Ma) ≈ RZiS poz. A (Przychody)",
+                            punkt=f"Grupa 70x (Ma) ≈ RZiS poz. A (Przychody)",
                             status=StatusAudytu.OSTRZEZ,
-                            uwagi=(f"Różnica: ZOiS konto 700 Ma={saldo_700_ma:,.2f} zł, "
-                                   f"RZiS A={przych:,.2f} zł | Δ={roznica:,.2f} zł. "
-                                   "Sprawdź czy inne konta 70x wpływają na pozycję A."),
+                            uwagi=(f"Różnica: ZOiS {konta_str}={suma_70_ma:,.2f} zł, "
+                                   f"RZiS A={przych:,.2f} zł | Δ={roznica:,.2f} zł."),
                         ))
 
         # 3. Suma grupy 4 (Wn) ≈ RZiS poz. B (Koszty operacyjne)
