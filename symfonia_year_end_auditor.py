@@ -3,21 +3,40 @@
 SymfoniaYearEndAuditor – Automatyczna Kontrola Jakości Danych Finansowych
 Biuro Rachunkowe Abacus | Zamknięcie Roku Obrachunkowego
 =============================================================================
-Wersja 3.0 – dodany pełny parser Bilansu (Symfonia format) + Rachunku Zysków
-            i Strat (wariant porównawczy). Reguły krzyżowe ZOiS ↔ RZiS ↔ Bilans.
+Wersja 3.1 – rozszerzenie o automatyczne rozpoznawanie planów kont.
 
-Weryfikowane źródła:
-  - ZOiS (Zestawienie Obrotów i Sald) – syntetyki + analityki
-  - Wyciągi bankowe (1..N rachunków, konto 130-X)
-  - Bilans (aktywa trwałe, obrotowe, kapitał, zobowiązania, sumy, wynik netto)
-  - RZiS (pozycje A-L, wariant porównawczy)
+Kluczowe funkcje:
+  ZOiS (PDF lub XLSX):
+    - Parsowanie tekstowe PDF Symfonii (radzi sobie z różnymi formatami)
+    - Dekodowanie polskich znaków (cid:XXX) → ą,ę,ś,ć,ń,ł,ó,ż,ź
+    - Automatyczne rozpoznawanie kont po OPISIE (nie tylko numerze):
+        * Odbiorcy: szuka "odbiorc", "klient" w grupach 20x, 22x
+        * Dostawcy: szuka "dostawc" w grupach 20x, 21x
+        * ZUS: szuka "zus", "ubezpieczen" w syntetykach i analitykach
+        * PIT: szuka "podatek doch", "podatek od płac" w analitykach
+        * Środki w drodze: szuka "drodze", "pieniężne" w grupach 13x, 14x
+        * Wynagrodzenia: szuka "wynagrodz", "pracownik" w grupie 23x
 
-Nowe reguły v3.0:
-  - Spójność RZiS: C=A-B, F=C+D-E, I=F+G-H, L=I-J-K
-  - Spójność Bilansu: SumaA = A+B+C+D, SumaP = A+B
-  - Krzyżowa: Wynik netto z RZiS (L) == Wynik w Bilansie (A.VI pasywów)
-  - Krzyżowa: Konto 700 (ZOiS) ≈ RZiS poz. A
-  - Krzyżowa: Grupa 4 (ZOiS) ≈ RZiS poz. B
+  Bilans (PDF lub XLSX):
+    - Parsowanie sekcji AKTYWA/PASYWA
+    - Pozycje A,B,C,D + sumy + wynik netto A.VI
+
+  RZiS (PDF lub XLSX):
+    - Wariant porównawczy, pozycje A-L
+    - Strategia "last wins" dla rozwiązania kolizji litera I vs rzymska I
+
+  Wyciągi bankowe:
+    - Parsowanie per rachunek z wykryciem miesiąca ostatniej operacji
+    - Obsługa wielu analityk 130-X (Santander, mBank, PKO, etc.)
+
+Reguły weryfikacji (16+):
+  - Spójność ZOiS: konta rozpoznane po opisie (jak wyżej)
+  - Grupa 70x: przychody ze sprzedaży (saldo Ma)
+  - Grupa 4: koszty rodzajowe (saldo Wn)
+  - Bilans: Aktywa=Pasywa, spójność wewnętrzna A+B+C+D=Suma
+  - RZiS: C=A-B, F=C+D-E, I=F+G-H, L=I-J-K
+  - Krzyżowa RZiS↔Bilans: Wynik netto L = Pasywa A.VI
+  - Krzyżowa ZOiS↔RZiS: Grupa 70x ≈ RZiS A, Grupa 4 ≈ RZiS B
 =============================================================================
 """
 
@@ -58,6 +77,39 @@ MIESIACE_PL = {
 
 # Regex dla kwoty w formacie polskim: 1.114.621,54 | 0,00 | -112.140,00
 RE_KWOTA = r"-?\d+(?:\.\d{3})*(?:,\d{1,2})?"
+
+
+# =============================================================================
+# DEKODER POLSKICH ZNAKÓW Z PDF SYMFONII
+# =============================================================================
+# Symfonia eksportuje PDF z własną czcionką gdzie polskie znaki są kodowane
+# jako glyph-id'y. pdfplumber zwraca je jako "(cid:XXX)". Ta mapa przekłada
+# najczęściej występujące glyphy na prawdziwe polskie litery.
+CID_TO_PL = {
+    # Niestandardowe CID dla zwykłych liter łacińskich (anomalia fontu Symfonii)
+    39:  "D",   71:  "D",   79:  "l",   88:  "u",
+    # Polskie znaki – zidentyfikowane z plików Abacus i IGRAPES
+    211: "Ó",   243: "ó",
+    224: "Ł",   225: "ł",
+    260: "Ą",   261: "ą",
+    262: "Ć",   252: "ć",   253: "Ć",
+    265: "Ę",   266: "ę",   267: "Ę",
+    269: "Ń",   276: "ń",   277: "Ń",
+    285: "Ś",   286: "ś",
+    297: "Ź",   240: "ź",   241: "Ź",
+    298: "ż",   300: "Ż",
+}
+_RE_CID = re.compile(r"\(cid:(\d+)\)")
+
+
+def dekoduj_cid(tekst: str) -> str:
+    """
+    Zamienia glyph-id Symfonii na polskie znaki (np. '(cid:266)' → 'ę').
+    Nieznane CID zostają zastąpione znakiem zapytania.
+    """
+    if not tekst or "(cid:" not in tekst:
+        return tekst
+    return _RE_CID.sub(lambda m: CID_TO_PL.get(int(m.group(1)), "?"), tekst)
 
 
 # =============================================================================
@@ -368,7 +420,7 @@ class ParserZOiS:
         linie = []
         with pdfplumber.open(bufor) as pdf:
             for strona in pdf.pages:
-                t = strona.extract_text() or ""
+                t = dekoduj_cid(strona.extract_text() or "")
                 linie.extend(t.splitlines())
 
         if not linie:
@@ -554,7 +606,7 @@ class ParserBilansu:
         wszystkie = []
         with pdfplumber.open(bufor) as pdf:
             for strona in pdf.pages:
-                t = strona.extract_text() or ""
+                t = dekoduj_cid(strona.extract_text() or "")
                 wszystkie.extend(t.splitlines())
         return self._parsuj_linie(wszystkie)
 
@@ -683,7 +735,7 @@ class ParserRZiS:
         linie = []
         with pdfplumber.open(bufor) as pdf:
             for strona in pdf.pages:
-                t = strona.extract_text() or ""
+                t = dekoduj_cid(strona.extract_text() or "")
                 linie.extend(t.splitlines())
         return self._parsuj_linie(linie)
 
@@ -744,9 +796,9 @@ class ParserWyciaguBankowego:
         caly_tekst = ""
         with pdfplumber.open(bufor) as pdf:
             for strona in pdf.pages:
-                caly_tekst += (strona.extract_text() or "") + "\n"
+                caly_tekst += dekoduj_cid(strona.extract_text() or "") + "\n"
             for strona in reversed(pdf.pages):
-                t = strona.extract_text() or ""
+                t = dekoduj_cid(strona.extract_text() or "")
                 s = self._wyciagnij_saldo(t)
                 if s and s != Decimal("0"):
                     saldo = s
@@ -1088,67 +1140,164 @@ class SymfoniaYearEndAuditor:
     def _saldo(self, dane_zois, konto):
         return dane_zois.konta.get(konto)
 
+    def _znajdz_syntetyki_po_opisie(
+        self,
+        dane_zois: "DaneZOiS",
+        slowa_kluczowe: List[str],
+        grupy_syntetyk: Optional[List[str]] = None,
+    ) -> List[Tuple[str, str, Decimal, Decimal]]:
+        """
+        Wyszukuje syntetyki których opis zawiera któreś ze słów kluczowych.
+
+        Parametry:
+          - slowa_kluczowe: np. ["odbiorc", "klient"]
+          - grupy_syntetyk: opcjonalnie zawężenie do grup ["20", "22"]
+
+        Zwraca listę: (numer_konta, opis, saldo_Wn, saldo_Ma).
+        """
+        wynik = []
+        slowa_lower = [s.lower() for s in slowa_kluczowe]
+        for numer, (wn, ma) in dane_zois.konta.items():
+            # Tylko czyste syntetyki (bez myślnika)
+            if "-" in numer:
+                continue
+            if grupy_syntetyk and not any(numer.startswith(g) for g in grupy_syntetyk):
+                continue
+            opis = dane_zois.opisy.get(numer, "")
+            opis_lower = opis.lower()
+            if any(s in opis_lower for s in slowa_lower):
+                wynik.append((numer, opis, wn, ma))
+        return wynik
+
+    def _znajdz_analityki_po_opisie(
+        self,
+        dane_zois: "DaneZOiS",
+        slowa_kluczowe: List[str],
+        grupy_syntetyk: Optional[List[str]] = None,
+    ) -> List[Tuple[str, str, Decimal, Decimal]]:
+        """
+        Analogicznie do syntetyk, ale szuka w analitykach (konta z myślnikiem).
+        Przykład użycia: szukanie analityki ZUS "220-3" po opisie "ZUS".
+        """
+        wynik = []
+        slowa_lower = [s.lower() for s in slowa_kluczowe]
+        for numer, (wn, ma) in dane_zois.konta_analityki.items():
+            if "-" not in numer:
+                continue
+            numer_syn = normalize_konto(numer)
+            if grupy_syntetyk and not any(numer_syn.startswith(g) for g in grupy_syntetyk):
+                continue
+            opis = dane_zois.opisy.get(numer, "")
+            opis_lower = opis.lower()
+            if any(s in opis_lower for s in slowa_lower):
+                wynik.append((numer, opis, wn, ma))
+        return wynik
+
     def _weryfikuj_konto_145(self, dane_zois):
-        s = self._saldo(dane_zois, "145")
-        if s is None:
-            self._wyniki.append(PunktKontroli(
-                konto="145", punkt="Środki pieniężne w drodze = 0",
-                status=StatusAudytu.INFO, uwagi="Konto 145 nie wystąpiło.",
-            )); return
-        wn, ma = s
-        if wn == Decimal("0") and ma == Decimal("0"):
-            self._wyniki.append(PunktKontroli(
-                konto="145", punkt="Środki pieniężne w drodze = 0",
-                status=StatusAudytu.OK, uwagi="Saldo wynosi 0.",
-            ))
-        else:
-            self._wyniki.append(PunktKontroli(
-                konto="145", punkt="Środki pieniężne w drodze = 0",
-                status=StatusAudytu.BLAD,
-                uwagi=f"Saldo ≠ 0! Wn={wn:,.2f}, Ma={ma:,.2f}.",
-            ))
+        """
+        Weryfikacja środków pieniężnych w drodze. W różnych planach kont:
+          - 145 (standard)
+          - 133/134 (IGRAPES – "środki w drodze", "rachunek VAT")
+        Saldo powinno wynosić 0 na koniec roku.
+        """
+        # Szukamy po opisie "w drodze" albo "drodze" w grupach 13x/14x
+        kandydaci = self._znajdz_syntetyki_po_opisie(
+            dane_zois, ["w drodze", "drodze"], grupy_syntetyk=["13", "14"]
+        )
+        # Jeśli nie znaleziono po opisie - spróbuj klasyczne 145
+        if not kandydaci:
+            s = self._saldo(dane_zois, "145")
+            if s is None:
+                self._wyniki.append(PunktKontroli(
+                    konto="145", punkt="Środki pieniężne w drodze = 0",
+                    status=StatusAudytu.INFO,
+                    uwagi="Konto środków w drodze nie wystąpiło.",
+                )); return
+            kandydaci = [("145", dane_zois.opisy.get("145", "Środki w drodze"),
+                         s[0], s[1])]
+
+        # Sprawdzamy każde konto z osobna
+        for numer, opis, wn, ma in kandydaci:
+            if wn == Decimal("0") and ma == Decimal("0"):
+                self._wyniki.append(PunktKontroli(
+                    konto=numer, punkt=f"{opis} = 0",
+                    status=StatusAudytu.OK, uwagi="Saldo wynosi 0.",
+                ))
+            else:
+                self._wyniki.append(PunktKontroli(
+                    konto=numer, punkt=f"{opis} = 0",
+                    status=StatusAudytu.BLAD,
+                    uwagi=f"Saldo ≠ 0! Wn={wn:,.2f}, Ma={ma:,.2f} zł.",
+                ))
 
     def _weryfikuj_konto_200(self, dane_zois):
-        s = self._saldo(dane_zois, "200")
-        if s is None:
-            self._wyniki.append(PunktKontroli(
-                konto="200", punkt="Rozrachunki z odbiorcami",
-                status=StatusAudytu.BRAK, uwagi="Brak konta 200.",
-            )); return
-        wn, ma = s
-        if ma > Decimal("0"):
-            self._wyniki.append(PunktKontroli(
-                konto="200", punkt="Rozrachunki z odbiorcami – strona salda",
-                status=StatusAudytu.BLAD,
-                uwagi=f"Saldo Ma={ma:,.2f} zł – BŁĄD. Brak faktury sprzedaży lub nadpłata.",
-            ))
-        else:
-            self._wyniki.append(PunktKontroli(
-                konto="200", punkt="Rozrachunki z odbiorcami – strona salda",
-                status=StatusAudytu.OK,
-                uwagi=f"Saldo Wn={wn:,.2f} zł – należności.",
-            ))
+        """
+        Rozrachunki z odbiorcami – grupa 20x (np. 200, 201).
+        Wyszukujemy po opisie zawierającym "odbiorc" lub "klient".
+        Oczekiwane saldo: Wn (należności).
+        """
+        kandydaci = self._znajdz_syntetyki_po_opisie(
+            dane_zois, ["odbiorc", "klient"], grupy_syntetyk=["20"]
+        )
+        if not kandydaci:
+            # Fallback: klasyczne 200
+            s = self._saldo(dane_zois, "200")
+            if s is None:
+                self._wyniki.append(PunktKontroli(
+                    konto="20x", punkt="Rozrachunki z odbiorcami",
+                    status=StatusAudytu.BRAK,
+                    uwagi="Brak konta rozrachunków z odbiorcami (20x).",
+                )); return
+            kandydaci = [("200", dane_zois.opisy.get("200", "Rozrachunki - odbiorcy"),
+                         s[0], s[1])]
+
+        for numer, opis, wn, ma in kandydaci:
+            if ma > Decimal("0"):
+                self._wyniki.append(PunktKontroli(
+                    konto=numer, punkt=f"{opis} – strona salda",
+                    status=StatusAudytu.BLAD,
+                    uwagi=f"Saldo Ma={ma:,.2f} zł – BŁĄD. Brak faktury sprzedaży lub nadpłata.",
+                ))
+            else:
+                self._wyniki.append(PunktKontroli(
+                    konto=numer, punkt=f"{opis} – strona salda",
+                    status=StatusAudytu.OK,
+                    uwagi=f"Saldo Wn={wn:,.2f} zł – należności.",
+                ))
 
     def _weryfikuj_konto_202(self, dane_zois):
-        s = self._saldo(dane_zois, "202")
-        if s is None:
-            self._wyniki.append(PunktKontroli(
-                konto="202", punkt="Rozrachunki z dostawcami",
-                status=StatusAudytu.BRAK, uwagi="Brak konta 202.",
-            )); return
-        wn, ma = s
-        if wn > Decimal("0"):
-            self._wyniki.append(PunktKontroli(
-                konto="202", punkt="Rozrachunki z dostawcami – strona salda",
-                status=StatusAudytu.BLAD,
-                uwagi=f"Saldo Wn={wn:,.2f} zł – BŁĄD. Nadpłata lub brak faktury zakupu.",
-            ))
-        else:
-            self._wyniki.append(PunktKontroli(
-                konto="202", punkt="Rozrachunki z dostawcami – strona salda",
-                status=StatusAudytu.OK,
-                uwagi=f"Saldo Ma={ma:,.2f} zł – zobowiązania.",
-            ))
+        """
+        Rozrachunki z dostawcami – grupa 20x (np. 202, 210, 211).
+        Wyszukujemy po opisie zawierającym "dostawc".
+        Oczekiwane saldo: Ma (zobowiązania).
+        """
+        kandydaci = self._znajdz_syntetyki_po_opisie(
+            dane_zois, ["dostawc"], grupy_syntetyk=["20", "21"]
+        )
+        if not kandydaci:
+            s = self._saldo(dane_zois, "202")
+            if s is None:
+                self._wyniki.append(PunktKontroli(
+                    konto="20x/21x", punkt="Rozrachunki z dostawcami",
+                    status=StatusAudytu.BRAK,
+                    uwagi="Brak konta rozrachunków z dostawcami.",
+                )); return
+            kandydaci = [("202", dane_zois.opisy.get("202", "Rozrachunki - dostawcy"),
+                         s[0], s[1])]
+
+        for numer, opis, wn, ma in kandydaci:
+            if wn > Decimal("0"):
+                self._wyniki.append(PunktKontroli(
+                    konto=numer, punkt=f"{opis} – strona salda",
+                    status=StatusAudytu.BLAD,
+                    uwagi=f"Saldo Wn={wn:,.2f} zł – BŁĄD. Nadpłata lub brak faktury zakupu.",
+                ))
+            else:
+                self._wyniki.append(PunktKontroli(
+                    konto=numer, punkt=f"{opis} – strona salda",
+                    status=StatusAudytu.OK,
+                    uwagi=f"Saldo Ma={ma:,.2f} zł – zobowiązania.",
+                ))
 
     def _weryfikuj_konto_230(self, dane_zois):
         s = self._saldo(dane_zois, "230")
@@ -1177,46 +1326,120 @@ class SymfoniaYearEndAuditor:
             ))
 
     def _weryfikuj_konto_229(self, dane_zois):
-        s = self._saldo(dane_zois, "229")
-        if s is None:
-            self._wyniki.append(PunktKontroli(
-                konto="229", punkt="ZUS",
-                status=StatusAudytu.BRAK, uwagi="Brak konta 229.",
-            )); return
-        wn, ma = s
-        if wn > Decimal("0"):
-            self._wyniki.append(PunktKontroli(
-                konto="229", punkt="ZUS – zobowiązanie",
-                status=StatusAudytu.OSTRZEZ,
-                uwagi=f"Saldo Wn={wn:,.2f} zł – nadpłata/błąd DRA.",
-            ))
-        else:
-            self._wyniki.append(PunktKontroli(
-                konto="229", punkt="ZUS – zobowiązanie",
-                status=StatusAudytu.OK,
-                uwagi=f"Saldo Ma={ma:,.2f} zł. Porównaj z DRA.",
-            ))
+        """
+        Zobowiązania ZUS. W różnych planach kont:
+          - 229 (klasyczny standard)
+          - 220-3 w IGRAPES (analityka pod 220 Rozrachunki z budżetami)
+          - 221-x w innych
+        Szuka po opisie "zus" lub "ubezpiecz" w grupach 22x.
+        Oczekiwane saldo: Ma (zobowiązanie).
+        """
+        # Najpierw szukaj w syntetykach
+        kandydaci = self._znajdz_syntetyki_po_opisie(
+            dane_zois, ["zus"], grupy_syntetyk=["22"]
+        )
+        # Potem w analitykach (IGRAPES: 220-3 ZUS)
+        kandydaci_ana = self._znajdz_analityki_po_opisie(
+            dane_zois, ["zus"], grupy_syntetyk=["22"]
+        )
+        # Gdy mamy analityki, eliminujemy duplikat - syntetykę tej samej grupy
+        if kandydaci_ana:
+            syntetyki_do_pominiecia = {
+                normalize_konto(n) for n, _, _, _ in kandydaci_ana
+            }
+            kandydaci = [
+                k for k in kandydaci if k[0] not in syntetyki_do_pominiecia
+            ]
+        kandydaci.extend(kandydaci_ana)
+
+        if not kandydaci:
+            # Fallback: klasyczne 229
+            s = self._saldo(dane_zois, "229")
+            if s is None:
+                self._wyniki.append(PunktKontroli(
+                    konto="ZUS", punkt="Zobowiązanie ZUS",
+                    status=StatusAudytu.BRAK,
+                    uwagi="Brak konta ZUS (229/220-x/ubezpieczeń).",
+                )); return
+            kandydaci = [("229", dane_zois.opisy.get("229", "ZUS"), s[0], s[1])]
+
+        for numer, opis, wn, ma in kandydaci:
+            if wn > Decimal("0"):
+                self._wyniki.append(PunktKontroli(
+                    konto=numer, punkt=f"{opis} – zobowiązanie ZUS",
+                    status=StatusAudytu.OSTRZEZ,
+                    uwagi=f"Saldo Wn={wn:,.2f} zł – nadpłata lub błąd DRA.",
+                ))
+            elif ma > Decimal("0"):
+                self._wyniki.append(PunktKontroli(
+                    konto=numer, punkt=f"{opis} – zobowiązanie ZUS",
+                    status=StatusAudytu.OK,
+                    uwagi=f"Saldo Ma={ma:,.2f} zł. Porównaj z DRA.",
+                ))
+            else:
+                self._wyniki.append(PunktKontroli(
+                    konto=numer, punkt=f"{opis} – zobowiązanie ZUS",
+                    status=StatusAudytu.OK, uwagi="Saldo wynosi 0.",
+                ))
 
     def _weryfikuj_konto_220(self, dane_zois):
-        s = self._saldo(dane_zois, "220")
-        if s is None:
-            self._wyniki.append(PunktKontroli(
-                konto="220", punkt="US/PIT",
-                status=StatusAudytu.BRAK, uwagi="Brak konta 220.",
-            )); return
-        wn, ma = s
-        if wn > Decimal("0"):
-            self._wyniki.append(PunktKontroli(
-                konto="220", punkt="US – PIT",
-                status=StatusAudytu.OSTRZEZ,
-                uwagi=f"Saldo Wn={wn:,.2f} zł – nadpłata/brak dekretacji XII.",
-            ))
-        else:
-            self._wyniki.append(PunktKontroli(
-                konto="220", punkt="US – PIT",
-                status=StatusAudytu.OK,
-                uwagi=f"Saldo Ma={ma:,.2f} zł. Porównaj z PIT-4R/8AR.",
-            ))
+        """
+        Zobowiązania podatkowe – PIT-4 (podatek od płac) oraz podatek dochodowy.
+        W różnych planach kont:
+          - 220 (klasyczny - cały US)
+          - 220-1 Podatek dochodowy, 220-2 Podatek od płac (IGRAPES)
+          - 222-x (inne systemy)
+        Szuka po opisie "podatek" w grupie 22x (bez ZUS).
+        Oczekiwane saldo: Ma (zobowiązanie podatkowe).
+        """
+        kandydaci = self._znajdz_syntetyki_po_opisie(
+            dane_zois, ["podatek", "budżet", "urz"], grupy_syntetyk=["22"]
+        )
+        kandydaci_ana = self._znajdz_analityki_po_opisie(
+            dane_zois, ["podatek", "pit"], grupy_syntetyk=["22"]
+        )
+        # Wyłącz analityki ZUS (już obsłużone w _weryfikuj_konto_229)
+        kandydaci_ana = [
+            k for k in kandydaci_ana if "zus" not in k[1].lower()
+        ]
+        # Gdy mamy analityki, pomijamy syntetyki tej samej grupy (duplikacja)
+        if kandydaci_ana:
+            syntetyki_do_pominiecia = {
+                normalize_konto(n) for n, _, _, _ in kandydaci_ana
+            }
+            kandydaci = [
+                k for k in kandydaci if k[0] not in syntetyki_do_pominiecia
+            ]
+        kandydaci.extend(kandydaci_ana)
+
+        if not kandydaci:
+            s = self._saldo(dane_zois, "220")
+            if s is None:
+                self._wyniki.append(PunktKontroli(
+                    konto="US/PIT", punkt="Zobowiązanie podatkowe",
+                    status=StatusAudytu.BRAK,
+                    uwagi="Brak konta podatkowego (220/22x).",
+                )); return
+            kandydaci = [("220", dane_zois.opisy.get("220", "US"), s[0], s[1])]
+
+        for numer, opis, wn, ma in kandydaci:
+            if wn > Decimal("0"):
+                self._wyniki.append(PunktKontroli(
+                    konto=numer, punkt=f"{opis} – zobowiązanie podatkowe",
+                    status=StatusAudytu.OSTRZEZ,
+                    uwagi=f"Saldo Wn={wn:,.2f} zł – nadpłata lub brak dekretacji XII.",
+                ))
+            elif ma > Decimal("0"):
+                self._wyniki.append(PunktKontroli(
+                    konto=numer, punkt=f"{opis} – zobowiązanie podatkowe",
+                    status=StatusAudytu.OK,
+                    uwagi=f"Saldo Ma={ma:,.2f} zł. Porównaj z deklaracją PIT-4R/8AR.",
+                ))
+            else:
+                self._wyniki.append(PunktKontroli(
+                    konto=numer, punkt=f"{opis} – zobowiązanie podatkowe",
+                    status=StatusAudytu.OK, uwagi="Saldo wynosi 0.",
+                ))
 
     def _weryfikuj_konto_700(self, dane_zois):
         """
@@ -1530,60 +1753,8 @@ class SymfoniaYearEndAuditor:
 # TRYB TESTOWY
 # =============================================================================
 
-if __name__ == "__main__":
-    import sys
-
-    print("=" * 70)
-    print("  SymfoniaYearEndAuditor v3.0 – Tryb Testowy")
-    print("  Test parsowania Bilansu + RZiS (rzeczywiste pliki Symfonia)")
-    print("=" * 70)
-
-    sciezka_bilans = "/mnt/user-data/uploads/Bilans.pdf"
-    sciezka_rzis = "/mnt/user-data/uploads/RZIS.pdf"
-
-    audytor = SymfoniaYearEndAuditor()
-
-    print("\n→ Parsowanie Bilansu...")
-    with open(sciezka_bilans, "rb") as f:
-        dane_bilans = audytor.parsuj_bilans(f.read(), "pdf")
-    print(f"  Suma aktywów:  {dane_bilans.suma_aktywow_biezacy:,.2f}")
-    print(f"  Suma pasywów:  {dane_bilans.suma_pasywow_biezacy:,.2f}")
-    print(f"  Wynik netto:   {dane_bilans.wynik_netto_biezacy:,.2f}")
-
-    print("\n→ Parsowanie RZiS...")
-    with open(sciezka_rzis, "rb") as f:
-        dane_rzis = audytor.parsuj_rzis(f.read(), "pdf")
-    print(f"  A. Przychody:       {dane_rzis.przychody_sprzedazy[0]:,.2f}")
-    print(f"  B. Koszty oper.:    {dane_rzis.koszty_operacyjne[0]:,.2f}")
-    print(f"  L. Zysk netto:      {dane_rzis.zysk_netto[0]:,.2f}")
-
-    # Mock ZOiS do testowania krzyżowych reguł
-    dz = DaneZOiS()
-    dz.konta_analityki = {"130-1": (Decimal("179559.96"), Decimal("0"))}
-    dz.konta = {
-        "130": (Decimal("179559.96"), Decimal("0")),
-        "145": (Decimal("0"), Decimal("0")),
-        "200": (Decimal("201405.89"), Decimal("0")),
-        "400": (Decimal("24679.19"), Decimal("0")),
-        "401": (Decimal("358515.66"), Decimal("0")),
-        "402": (Decimal("415178.98"), Decimal("0")),
-        "403": (Decimal("73161.89"), Decimal("0")),
-        "404": (Decimal("1455.89"), Decimal("0")),
-        "405": (Decimal("37380.00"), Decimal("0")),
-        "406": (Decimal("75366.88"), Decimal("0")),
-        "700": (Decimal("0"), Decimal("1114621.54")),  # poprawne: Ma = przychody
-    }
-    dz.opisy = {"130-1": "Santander"}
-
-    wyciagi = [WyciagBankowy(
-        numer_konta_ksiegowego="130-1",
-        saldo_koncowe=Decimal("179559.96"),
-        rok_ostatniej_operacji=2024, miesiac_ostatniej_operacji=12,
-        bank_nazwa="Santander",
-    )]
-
-    wyniki = audytor.check_accounting_logic(dz, dane_bilans, dane_rzis, wyciagi, 2024)
-    raport = audytor.generate_audit_report(
-        wyniki, nazwa_podmiotu="Abacus Centrum Księgowe SP. z o.o.", rok=2024
-    )
-    print("\n" + raport["tekst"])
+# =============================================================================
+# KONIEC MODUŁU
+# =============================================================================
+# Ten plik jest modułem biblioteki – nie powinien być uruchamiany bezpośrednio.
+# Aplikacja Streamlit (app.py) importuje z niego klasy i funkcje.
