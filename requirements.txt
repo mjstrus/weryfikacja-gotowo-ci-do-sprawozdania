@@ -1,5 +1,5 @@
-streamlit
-pandas
-openpyxl
-pdfplumber
-plotly
+streamlit>=1.28.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+pdfplumber>=0.10.0
+requests>=2.31.0
