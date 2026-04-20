@@ -1,1812 +1,781 @@
 """
 =============================================================================
-SymfoniaYearEndAuditor – Automatyczna Kontrola Jakości Danych Finansowych
-Biuro Rachunkowe Abacus | Zamknięcie Roku Obrachunkowego
+Abacus Centrum Księgowe – Kontrola Jakości Zamknięcia Roku
+Streamlit Frontend v2.0 (wieloraczkowe rachunki bankowe)
 =============================================================================
-Wersja 3.1 – rozszerzenie o automatyczne rozpoznawanie planów kont.
-
-Kluczowe funkcje:
-  ZOiS (PDF lub XLSX):
-    - Parsowanie tekstowe PDF Symfonii (radzi sobie z różnymi formatami)
-    - Dekodowanie polskich znaków (cid:XXX) → ą,ę,ś,ć,ń,ł,ó,ż,ź
-    - Automatyczne rozpoznawanie kont po OPISIE (nie tylko numerze):
-        * Odbiorcy: szuka "odbiorc", "klient" w grupach 20x, 22x
-        * Dostawcy: szuka "dostawc" w grupach 20x, 21x
-        * ZUS: szuka "zus", "ubezpieczen" w syntetykach i analitykach
-        * PIT: szuka "podatek doch", "podatek od płac" w analitykach
-        * Środki w drodze: szuka "drodze", "pieniężne" w grupach 13x, 14x
-        * Wynagrodzenia: szuka "wynagrodz", "pracownik" w grupie 23x
-
-  Bilans (PDF lub XLSX):
-    - Parsowanie sekcji AKTYWA/PASYWA
-    - Pozycje A,B,C,D + sumy + wynik netto A.VI
-
-  RZiS (PDF lub XLSX):
-    - Wariant porównawczy, pozycje A-L
-    - Strategia "last wins" dla rozwiązania kolizji litera I vs rzymska I
-
-  Wyciągi bankowe:
-    - Parsowanie per rachunek z wykryciem miesiąca ostatniej operacji
-    - Obsługa wielu analityk 130-X (Santander, mBank, PKO, etc.)
-
-Reguły weryfikacji (16+):
-  - Spójność ZOiS: konta rozpoznane po opisie (jak wyżej)
-  - Grupa 70x: przychody ze sprzedaży (saldo Ma)
-  - Grupa 4: koszty rodzajowe (saldo Wn)
-  - Bilans: Aktywa=Pasywa, spójność wewnętrzna A+B+C+D=Suma
-  - RZiS: C=A-B, F=C+D-E, I=F+G-H, L=I-J-K
-  - Krzyżowa RZiS↔Bilans: Wynik netto L = Pasywa A.VI
-  - Krzyżowa ZOiS↔RZiS: Grupa 70x ≈ RZiS A, Grupa 4 ≈ RZiS B
+Flow dwuetapowy:
+  1. ANALIZA ZOiS → wykrycie wszystkich analityk konta 130 (rachunków)
+  2. UZUPEŁNIENIE WYCIĄGÓW → dla każdego rachunku wyciąg lub ręczne saldo
+  3. URUCHOMIENIE AUDYTU → pełna weryfikacja
 =============================================================================
 """
 
-from __future__ import annotations
-
-import io
-import re
-import logging
-from dataclasses import dataclass, field
-from datetime import date
-from decimal import Decimal, InvalidOperation
-from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
+from decimal import Decimal
 
 import pandas as pd
+import streamlit as st
 
-# ── Opcjonalne biblioteki ─────────────────────────────────────────────────────
-try:
-    import pdfplumber
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
+from symfonia_year_end_auditor import (
+    SymfoniaYearEndAuditor,
+    DaneZOiS,
+    DaneBilansu,
+    DaneRZiS,
+    WyciagBankowy,
+    MIESIACE_PL,
+    normalize_currency,
+)
 
-try:
-    import openpyxl
-    EXCEL_AVAILABLE = True
-except ImportError:
-    EXCEL_AVAILABLE = False
+# =============================================================================
+# KONFIGURACJA
+# =============================================================================
 
-logger = logging.getLogger("SymfoniaAuditor")
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+st.set_page_config(
+    page_title="Kontrola Zamknięcia Roku | Abacus",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-MIESIACE_PL = {
-    1: "styczeń", 2: "luty", 3: "marzec", 4: "kwiecień",
-    5: "maj", 6: "czerwiec", 7: "lipiec", 8: "sierpień",
-    9: "wrzesień", 10: "październik", 11: "listopad", 12: "grudzień",
+# =============================================================================
+# CSS – STYL ABACUS
+# =============================================================================
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+/* Nagłówek */
+.abacus-header {
+    background: linear-gradient(135deg, #0d1b2a 0%, #1b2d45 50%, #0d1b2a 100%);
+    border-radius: 12px;
+    padding: 28px 36px;
+    margin-bottom: 24px;
+    display: flex; align-items: center; gap: 20px;
+    box-shadow: 0 4px 24px rgba(13, 27, 42, 0.35);
+    border: 1px solid rgba(255,255,255,0.07);
+}
+.abacus-logo { font-size: 2.6rem; line-height: 1; }
+.abacus-title-block h1 {
+    color: #ffffff; font-size: 1.55rem; font-weight: 700;
+    margin: 0; letter-spacing: -0.3px;
+}
+.abacus-title-block p {
+    color: #8ca9c9; font-size: 0.82rem; margin: 4px 0 0 0;
+    text-transform: uppercase; letter-spacing: 0.3px;
 }
 
-# Regex dla kwoty w formacie polskim: 1.114.621,54 | 0,00 | -112.140,00
-RE_KWOTA = r"-?\d+(?:\.\d{3})*(?:,\d{1,2})?"
-
-
-# =============================================================================
-# DEKODER POLSKICH ZNAKÓW Z PDF SYMFONII
-# =============================================================================
-# Symfonia eksportuje PDF z własną czcionką gdzie polskie znaki są kodowane
-# jako glyph-id'y. pdfplumber zwraca je jako "(cid:XXX)". Ta mapa przekłada
-# najczęściej występujące glyphy na prawdziwe polskie litery.
-CID_TO_PL = {
-    # Niestandardowe CID dla zwykłych liter łacińskich (anomalia fontu Symfonii)
-    39:  "D",   71:  "D",   79:  "l",   88:  "u",
-    # Polskie znaki – zidentyfikowane z plików Abacus i IGRAPES
-    211: "Ó",   243: "ó",
-    224: "Ł",   225: "ł",
-    260: "Ą",   261: "ą",
-    262: "Ć",   252: "ć",   253: "Ć",
-    265: "Ę",   266: "ę",   267: "Ę",
-    269: "Ń",   276: "ń",   277: "Ń",
-    285: "Ś",   286: "ś",
-    297: "Ź",   240: "ź",   241: "Ź",
-    298: "ż",   300: "Ż",
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    background: #f4f6f8 !important; border-right: 1px solid #e0e6ed;
 }
-_RE_CID = re.compile(r"\(cid:(\d+)\)")
+section[data-testid="stSidebar"] .stMarkdown h3 {
+    color: #0d1b2a; font-size: 0.78rem; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 1px;
+    margin-top: 20px; margin-bottom: 8px;
+    padding-bottom: 4px; border-bottom: 2px solid #1b2d45;
+}
 
+/* Karty metryk */
+.metric-card {
+    background: #ffffff; border-radius: 10px; padding: 18px 20px;
+    border: 1px solid #e4e9f0; text-align: center;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+}
+.metric-card .metric-value { font-size: 2.2rem; font-weight: 700; line-height: 1; margin-bottom: 6px; }
+.metric-card .metric-label {
+    font-size: 0.78rem; color: #6b7a8d; font-weight: 500;
+    text-transform: uppercase; letter-spacing: 0.5px;
+}
+.metric-ok   { border-top: 4px solid #22c55e; } .metric-ok   .metric-value { color: #16a34a; }
+.metric-blad { border-top: 4px solid #ef4444; } .metric-blad .metric-value { color: #dc2626; }
+.metric-warn { border-top: 4px solid #f59e0b; } .metric-warn .metric-value { color: #d97706; }
+.metric-brak { border-top: 4px solid #94a3b8; } .metric-brak .metric-value { color: #64748b; }
 
-def dekoduj_cid(tekst: str) -> str:
-    """
-    Zamienia glyph-id Symfonii na polskie znaki (np. '(cid:266)' → 'ę').
-    Nieznane CID zostają zastąpione znakiem zapytania.
-    """
-    if not tekst or "(cid:" not in tekst:
-        return tekst
-    return _RE_CID.sub(lambda m: CID_TO_PL.get(int(m.group(1)), "?"), tekst)
+/* Wiersze wyników */
+.wynik-row {
+    border-radius: 8px; padding: 12px 16px; margin-bottom: 6px;
+    border-left: 5px solid; display: flex; align-items: flex-start; gap: 12px;
+}
+.wynik-row.ok      { background: #f0fdf4; border-color: #22c55e; }
+.wynik-row.blad    { background: #fef2f2; border-color: #ef4444; }
+.wynik-row.ostrzez { background: #fffbeb; border-color: #f59e0b; }
+.wynik-row.brak    { background: #f8fafc; border-color: #94a3b8; }
+.wynik-row.info    { background: #eff6ff; border-color: #3b82f6; }
+.wynik-icon { font-size: 1.2rem; margin-top: 1px; min-width: 24px; }
+.wynik-content .konto-label {
+    font-weight: 700; font-size: 0.78rem;
+    text-transform: uppercase; letter-spacing: 0.8px; color: #374151;
+}
+.wynik-content .punkt-text {
+    font-size: 0.88rem; color: #1f2937; font-weight: 500; margin: 2px 0;
+}
+.wynik-content .uwagi-text {
+    font-size: 0.81rem; color: #6b7a8d; line-height: 1.45;
+}
+
+/* Ocena końcowa */
+.ocena-banner {
+    border-radius: 10px; padding: 18px 24px; font-size: 1rem;
+    font-weight: 600; text-align: center; margin-top: 20px;
+}
+.ocena-ok   { background: #dcfce7; color: #14532d; border: 1px solid #86efac; }
+.ocena-warn { background: #fef9c3; color: #713f12; border: 1px solid #fde047; }
+.ocena-blad { background: #fee2e2; color: #7f1d1d; border: 1px solid #fca5a5; }
+
+/* Sekcje */
+.section-title {
+    font-size: 0.75rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 1.2px; color: #64748b;
+    margin: 20px 0 10px; display: flex; align-items: center; gap: 8px;
+}
+.section-title::after {
+    content: ''; flex: 1; height: 1px; background: #e2e8f0;
+}
+
+/* Rachunek card */
+.rachunek-card {
+    background: #ffffff; border: 1px solid #e4e9f0; border-radius: 10px;
+    padding: 16px 20px; margin-bottom: 12px;
+    border-left: 4px solid #1b2d45;
+}
+.rachunek-card.uzupelniony { border-left-color: #22c55e; background: #f0fdf4; }
+.rachunek-card.brak        { border-left-color: #f59e0b; background: #fffbeb; }
+
+.rachunek-header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 10px;
+}
+.rachunek-number {
+    font-weight: 700; color: #0d1b2a; font-size: 0.95rem;
+}
+.rachunek-saldo {
+    font-weight: 600; color: #1b2d45; font-size: 0.9rem;
+    background: #eff6ff; padding: 4px 10px; border-radius: 6px;
+}
+.rachunek-opis {
+    color: #6b7a8d; font-size: 0.82rem; margin-bottom: 8px;
+}
+
+/* Stepper */
+.stepper {
+    display: flex; gap: 8px; margin-bottom: 20px;
+}
+.stepper-item {
+    flex: 1; padding: 12px 16px; border-radius: 8px;
+    background: #f1f5f9; border: 1px solid #e2e8f0;
+    text-align: center;
+}
+.stepper-item.active {
+    background: #0d1b2a; color: #ffffff; border-color: #0d1b2a;
+}
+.stepper-item.done {
+    background: #dcfce7; color: #14532d; border-color: #86efac;
+}
+.stepper-item .step-num {
+    font-weight: 700; font-size: 0.8rem; display: block;
+}
+.stepper-item .step-label {
+    font-size: 0.75rem; margin-top: 2px;
+}
+
+#MainMenu, footer, header { visibility: hidden; }
+</style>
+""", unsafe_allow_html=True)
 
 
 # =============================================================================
-# TYPY
+# NAGŁÓWEK
 # =============================================================================
 
-class StatusAudytu(Enum):
-    OK       = "✅ OK"
-    BLAD     = "❌ BŁĄD"
-    OSTRZEZ  = "⚠️  OSTRZEŻENIE"
-    BRAK     = "🔍 BRAK DANYCH"
-    INFO     = "ℹ️  INFO"
+st.markdown("""
+<div class="abacus-header">
+    <div class="abacus-logo">📊</div>
+    <div class="abacus-title-block">
+        <h1>Kontrola Jakości – Zamknięcie Roku Obrachunkowego</h1>
+        <p>Abacus Centrum Księgowe Puławy &nbsp;·&nbsp; ZOiS · Bilans · RZiS · Wyciągi Bankowe</p>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 
-@dataclass
-class PunktKontroli:
-    konto:   str
-    punkt:   str
-    status:  StatusAudytu
-    uwagi:   str = ""
-    wartosc: str = ""
+# =============================================================================
+# INICJALIZACJA STANU
+# =============================================================================
+
+def reset_state():
+    """Reset wszystkich danych audytu."""
+    for k in ["dane_zois", "dane_bilans", "dane_rzis", "konta_bankowe",
+              "wyciagi", "raport", "etap"]:
+        if k in st.session_state:
+            del st.session_state[k]
+
+if "etap" not in st.session_state:
+    st.session_state["etap"] = 1  # 1=ZOiS, 2=wyciągi, 3=raport
+
+if "wyciagi" not in st.session_state:
+    st.session_state["wyciagi"] = {}  # klucz: numer_ksiegowy → WyciagBankowy
 
 
-@dataclass
-class DaneZOiS:
-    """
-    Zestawienie Obrotów i Sald z Symfonii – syntetyki + analityki.
-    """
-    konta: Dict[str, Tuple[Decimal, Decimal]] = field(default_factory=dict)
-    konta_analityki: Dict[str, Tuple[Decimal, Decimal]] = field(default_factory=dict)
-    opisy: Dict[str, str] = field(default_factory=dict)
+# =============================================================================
+# SIDEBAR – DANE PODMIOTU
+# =============================================================================
 
-    def pobierz_konta_bankowe(self) -> List[Tuple[str, str, Decimal]]:
-        """Zwraca listę wszystkich rachunków bankowych (analityki 130)."""
-        wynik = []
-        for numer, (wn, ma) in self.konta_analityki.items():
-            if normalize_konto(numer) == "130":
-                saldo_netto = wn - ma
-                opis = self.opisy.get(numer, "Rachunek bankowy")
-                wynik.append((numer, opis, saldo_netto))
-        if not wynik and "130" in self.konta:
-            wn, ma = self.konta["130"]
-            wynik.append(("130", self.opisy.get("130", "Rachunek bankowy"), wn - ma))
-        return sorted(wynik, key=lambda x: x[0])
+with st.sidebar:
+    st.markdown("### 🏢 Podmiot")
+    nazwa_podmiotu = st.text_input(
+        "Nazwa podmiotu",
+        value=st.session_state.get("nazwa_podmiotu", ""),
+        placeholder="np. FIRMA SP. Z O.O.",
+        key="input_nazwa",
+    )
+    st.session_state["nazwa_podmiotu"] = nazwa_podmiotu
 
+    rok = st.selectbox(
+        "Rok obrachunkowy",
+        options=[2024, 2023, 2022],
+        index=0, key="input_rok",
+    )
+    st.session_state["rok"] = rok
 
-@dataclass
-class DaneBilansu:
-    """
-    Dane Bilansu sparsowane z Symfonii.
-    Zawiera zarówno szczegółowe pozycje (A.aktywa trwałe, B.obrotowe, C, D)
-    jak i sumy bilansowe. Wynik netto pobierany z pasywów A.VI.
-    """
-    # AKTYWA (sekcja AKTYWA w PDF)
-    aktywa_trwale_biezacy:    Decimal = Decimal("0")   # poz. A
-    aktywa_trwale_ubiegly:    Decimal = Decimal("0")
-    aktywa_obrotowe_biezacy:  Decimal = Decimal("0")   # poz. B
-    aktywa_obrotowe_ubiegly:  Decimal = Decimal("0")
-    nalezne_wplaty_biezacy:   Decimal = Decimal("0")   # poz. C
-    nalezne_wplaty_ubiegly:   Decimal = Decimal("0")
-    udzialy_wlasne_biezacy:   Decimal = Decimal("0")   # poz. D
-    udzialy_wlasne_ubiegly:   Decimal = Decimal("0")
-    suma_aktywow_biezacy:     Decimal = Decimal("0")
-    suma_aktywow_ubiegly:     Decimal = Decimal("0")
+    st.markdown("---")
+    st.markdown("### ⚙️ Akcje")
 
-    # PASYWA (sekcja PASYWA w PDF)
-    kapital_wlasny_biezacy:   Decimal = Decimal("0")   # poz. A
-    kapital_wlasny_ubiegly:   Decimal = Decimal("0")
-    zobowiazania_biezacy:     Decimal = Decimal("0")   # poz. B
-    zobowiazania_ubiegly:     Decimal = Decimal("0")
-    suma_pasywow_biezacy:     Decimal = Decimal("0")
-    suma_pasywow_ubiegly:     Decimal = Decimal("0")
+    if st.button("🔄 Rozpocznij od nowa", use_container_width=True):
+        reset_state()
+        st.rerun()
 
-    # Wynik netto z Bilansu (pasywa A.VI) – do weryfikacji krzyżowej z RZiS
-    wynik_netto_biezacy:      Decimal = Decimal("0")
-    wynik_netto_ubiegly:      Decimal = Decimal("0")
+    st.markdown("---")
+    st.markdown("### 📊 Postęp audytu")
 
-    # ── Kompatybilność wsteczna z v2.0 ───────────────────────────────────────
-    @property
-    def aktywa_biezacy(self) -> Decimal: return self.suma_aktywow_biezacy
-    @property
-    def pasywa_biezacy(self) -> Decimal: return self.suma_pasywow_biezacy
-    @property
-    def aktywa_ubiegly(self) -> Decimal: return self.suma_aktywow_ubiegly
-    @property
-    def pasywa_ubiegly(self) -> Decimal: return self.suma_pasywow_ubiegly
+    # Stepper indicator
+    e = st.session_state["etap"]
+    def krok_klasa(n):
+        if e > n: return "done"
+        if e == n: return "active"
+        return ""
 
-
-@dataclass
-class DaneRZiS:
-    """
-    Rachunek Zysków i Strat (wariant porównawczy).
-    Każda pozycja: (rok bieżący, rok ubiegły).
-
-    Pozycje A-L zgodne ze standardem polskiej ustawy o rachunkowości:
-      A. Przychody netto ze sprzedaży
-      B. Koszty działalności operacyjnej
-      C. Zysk (strata) ze sprzedaży = A - B
-      D. Pozostałe przychody operacyjne
-      E. Pozostałe koszty operacyjne
-      F. Zysk (strata) z działalności operacyjnej = C + D - E
-      G. Przychody finansowe
-      H. Koszty finansowe
-      I. Zysk (strata) brutto = F + G - H
-      J. Podatek dochodowy
-      K. Pozostałe obowiązkowe zmniejszenia zysku
-      L. Zysk (strata) netto = I - J - K
-    """
-    przychody_sprzedazy:       Tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))  # A
-    koszty_operacyjne:         Tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))  # B
-    zysk_sprzedazy:            Tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))  # C
-    pozostale_przych_oper:     Tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))  # D
-    pozostale_koszty_oper:     Tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))  # E
-    zysk_dzialalnosci_oper:    Tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))  # F
-    przychody_finansowe:       Tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))  # G
-    koszty_finansowe:          Tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))  # H
-    zysk_brutto:               Tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))  # I
-    podatek_dochodowy:         Tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))  # J
-    pozostale_zmniejszenia:    Tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))  # K
-    zysk_netto:                Tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))  # L
-
-    # Mapa litera → pole (używane przy parsowaniu i walidacji)
-    MAPA_POZYCJI = {
-        "A": "przychody_sprzedazy",
-        "B": "koszty_operacyjne",
-        "C": "zysk_sprzedazy",
-        "D": "pozostale_przych_oper",
-        "E": "pozostale_koszty_oper",
-        "F": "zysk_dzialalnosci_oper",
-        "G": "przychody_finansowe",
-        "H": "koszty_finansowe",
-        "I": "zysk_brutto",
-        "J": "podatek_dochodowy",
-        "K": "pozostale_zmniejszenia",
-        "L": "zysk_netto",
-    }
-
-
-@dataclass
-class WyciagBankowy:
-    """Pojedynczy wyciąg bankowy powiązany z analityką 130-X."""
-    numer_konta_ksiegowego: str
-    saldo_koncowe: Decimal
-    rok_ostatniej_operacji: Optional[int] = None
-    miesiac_ostatniej_operacji: Optional[int] = None
-    numer_rachunku: str = ""
-    bank_nazwa: str = ""
-    wgrany_plik: bool = True
-
-    @property
-    def okres_opisowy(self) -> str:
-        if self.miesiac_ostatniej_operacji and self.rok_ostatniej_operacji:
-            return f"{MIESIACE_PL.get(self.miesiac_ostatniej_operacji, '?')} {self.rok_ostatniej_operacji}"
-        elif self.rok_ostatniej_operacji:
-            return str(self.rok_ostatniej_operacji)
-        return "okres nieznany"
+    st.markdown(f"""
+    <div style="display:flex; flex-direction:column; gap:6px;">
+        <div class="stepper-item {krok_klasa(1)}" style="text-align:left;padding:8px 12px;">
+            <span class="step-num">1. Analiza ZOiS</span>
+            <span class="step-label">Wykrycie rachunków</span>
+        </div>
+        <div class="stepper-item {krok_klasa(2)}" style="text-align:left;padding:8px 12px;">
+            <span class="step-num">2. Wyciągi</span>
+            <span class="step-label">Uzupełnienie sald</span>
+        </div>
+        <div class="stepper-item {krok_klasa(3)}" style="text-align:left;padding:8px 12px;">
+            <span class="step-num">3. Raport</span>
+            <span class="step-label">Wynik audytu</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # =============================================================================
 # FUNKCJE POMOCNICZE
 # =============================================================================
 
-def normalize_currency(wartosc: Union[str, float, int, None]) -> Decimal:
-    """Normalizuje kwotę finansową do Decimal."""
-    if wartosc is None:
-        return Decimal("0")
-    if isinstance(wartosc, (int, float)):
-        try:
-            return Decimal(str(round(float(wartosc), 2)))
-        except (InvalidOperation, ValueError):
-            return Decimal("0")
-    tekst = str(wartosc).strip()
-    if not tekst or tekst in ("-", "–", "0,00", "0.00"):
-        return Decimal("0")
-    tekst = re.sub(r"[złZŁPLN\xa0]", "", tekst).strip()
-    if "," in tekst and "." in tekst:
-        if tekst.rfind(",") > tekst.rfind("."):
-            tekst = tekst.replace(".", "").replace(",", ".")
-        else:
-            tekst = tekst.replace(",", "")
-    elif "," in tekst:
-        czesci = tekst.split(",")
-        if len(czesci) == 2 and len(czesci[1]) <= 2:
-            tekst = tekst.replace(",", ".")
-        else:
-            tekst = tekst.replace(",", "")
-    tekst = tekst.replace(" ", "")
-    try:
-        return Decimal(tekst).quantize(Decimal("0.01"))
-    except InvalidOperation:
-        raise ValueError(f"Nie można znormalizować kwoty: '{wartosc}'")
-
-
-def normalize_konto(numer: str) -> str:
-    if not numer:
-        return ""
-    return str(numer).strip().split("-")[0].strip()
-
-
-def get_grupa(numer_konta: str) -> Optional[int]:
-    syntetyka = normalize_konto(numer_konta)
-    if syntetyka and syntetyka[0].isdigit():
-        return int(syntetyka[0])
-    return None
-
-
-def wykryj_date_ostatniej_operacji(tekst: str) -> Optional[Tuple[int, int]]:
-    """Wykrywa rok i miesiąc ostatniej operacji w wyciągu bankowym."""
-    wszystkie_daty: List[date] = []
-    wzorce = [
-        r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})",
-        r"(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})",
-    ]
-    for wzorzec in wzorce:
-        for m in re.finditer(wzorzec, tekst):
-            g = m.groups()
-            try:
-                if len(g[0]) == 4:
-                    rok, mies, dzien = int(g[0]), int(g[1]), int(g[2])
-                else:
-                    dzien, mies, rok = int(g[0]), int(g[1]), int(g[2])
-                if 1 <= mies <= 12 and 1 <= dzien <= 31 and 2000 <= rok <= 2100:
-                    wszystkie_daty.append(date(rok, mies, dzien))
-            except (ValueError, IndexError):
-                continue
-    for m in re.finditer(r"\b(\d{1,2})/(\d{4})\b", tekst):
-        try:
-            mies, rok = int(m.group(1)), int(m.group(2))
-            if 1 <= mies <= 12 and 2000 <= rok <= 2100:
-                wszystkie_daty.append(date(rok, mies, 1))
-        except ValueError:
-            continue
-    if not wszystkie_daty:
-        return None
-    najpozniejsza = max(wszystkie_daty)
-    return (najpozniejsza.year, najpozniejsza.month)
-
-
-# =============================================================================
-# PARSER ZOiS
-# =============================================================================
-
-class ParserZOiS:
-    KOLUMNY_KONTO = ["konto", "numer konta", "nr konta", "symbol konta", "account"]
-    KOLUMNY_NAZWA = ["nazwa", "nazwa konta", "opis", "name"]
-    KOLUMNY_SALDO_WN = ["saldo wn", "saldo_wn", "debet", "wn", "saldo dt", "dt"]
-    KOLUMNY_SALDO_MA = ["saldo ma", "saldo_ma", "kredyt", "ma", "saldo ct", "ct"]
-
-    def _znajdz_kolumne(self, df, kandydaci):
-        kol_lower = {k.lower().strip(): k for k in df.columns}
-        for k in kandydaci:
-            if k.lower() in kol_lower:
-                return kol_lower[k.lower()]
-        return None
-
-    def parsuj_xlsx(self, dane_binarne: bytes) -> DaneZOiS:
-        bufor = io.BytesIO(dane_binarne)
-        try:
-            wb = openpyxl.load_workbook(bufor, data_only=True)
-        except Exception as e:
-            raise ValueError(f"Błąd odczytu XLSX (ZOiS): {e}")
-        arkusz = wb.active
-        for nazwa in ["ZOiS", "Zestawienie", "ObrotyiSalda", "Sheet1"]:
-            if nazwa in wb.sheetnames:
-                arkusz = wb[nazwa]
-                break
-        wiersze = [list(w) for w in arkusz.iter_rows(values_only=True)]
-        if not wiersze:
-            raise ValueError("Arkusz ZOiS jest pusty.")
-        idx = self._znajdz_wiersz_naglowka(wiersze)
-        if idx is None:
-            raise ValueError("Nie znaleziono wiersza nagłówkowego w ZOiS.")
-        naglowki = [str(k).strip() if k else "" for k in wiersze[idx]]
-        df = pd.DataFrame(wiersze[idx+1:], columns=naglowki)
-        return self._parsuj_dataframe(df, "XLSX")
-
-    def _znajdz_wiersz_naglowka(self, wiersze):
-        kluczowe = {"konto", "saldo", "wn", "ma", "obroty", "numer"}
-        for i, w in enumerate(wiersze[:20]):
-            vals = {str(v).lower().strip() for v in w if v is not None}
-            if len(vals & kluczowe) >= 2:
-                return i
-        return None
-
-    # Regex do rozpoznawania wierszy w tekstowej wersji PDF Symfonii
-    RE_NUMER_KONTA = re.compile(r"^(\d{2,3}(?:-\d+)*)\s+(.*)$")
-    RE_LICZBA_PL = re.compile(r"-?\d+(?:\.\d{3})*,\d{1,2}")
-    LINIE_IGNOROWANE = (
-        "Suma strony", "Suma razem", "Z przeniesienia", "Do przeniesienia",
-    )
-
-    def parsuj_pdf(self, dane_binarne: bytes) -> DaneZOiS:
-        """
-        Parser PDF ZOiS z Symfonii.
-        Symfonia eksportuje PDF jako tekst w kolumnach (bez obramowań tabeli),
-        więc używamy ekstraktu tekstu + regex zamiast extract_tables().
-
-        Strategia:
-          1. Iteruj po liniach - każda potencjalnie to wiersz kontowy
-          2. Wiersz zaczyna się od numeru konta (np. 130, 201-5, 403-1-1)
-          3. Długie nazwy klientów mogą być wieloliniowe - obsługa przenoszenia
-          4. Z końca linii bierzemy 8 liczb (BO Wn, BO Ma, obroty Wn/Ma,
-             narast Wn/Ma, Saldo Wn, Saldo Ma) - interesują nas 2 ostatnie
-        """
-        if not PDF_AVAILABLE:
-            raise ImportError("Brak biblioteki pdfplumber.")
-        bufor = io.BytesIO(dane_binarne)
-        linie = []
-        with pdfplumber.open(bufor) as pdf:
-            for strona in pdf.pages:
-                t = dekoduj_cid(strona.extract_text() or "")
-                linie.extend(t.splitlines())
-
-        if not linie:
-            raise ValueError("PDF jest pusty lub nie udało się ekstraktować tekstu.")
-
-        wynik = DaneZOiS()
-        czek_konto: Optional[str] = None
-        czek_nazwa: str = ""
-
-        def zapisz(numer: str, nazwa: str, saldo_wn: str, saldo_ma: str):
-            """Zapisuje pozycję do DaneZOiS - do syntetyk i/lub analityk."""
-            try:
-                wn = normalize_currency(saldo_wn)
-                ma = normalize_currency(saldo_ma)
-            except ValueError:
-                return
-            numer_syn = normalize_konto(numer)
-            if not re.match(r"^\d+$", numer_syn):
-                return
-
-            # Zapis jako analityka jeśli numer zawiera "-"
-            if numer != numer_syn:
-                wynik.konta_analityki[numer] = (wn, ma)
-                if nazwa and numer not in wynik.opisy:
-                    wynik.opisy[numer] = nazwa.strip()
-            else:
-                # Czysta syntetyka
-                wynik.konta[numer_syn] = (wn, ma)
-                if nazwa and numer_syn not in wynik.opisy:
-                    wynik.opisy[numer_syn] = nazwa.strip()
-                # Dla kompatybilności wstecznej z audytorem: zapisz też do konta
-                # (syntetyki występują w ZOiS tylko raz, więc nie nadpisujemy)
-
-        for linia in linie:
-            ln = linia.strip()
-            if not ln:
-                continue
-            # Pomijamy linie podsumowujące
-            if any(x in ln for x in self.LINIE_IGNOROWANE):
-                continue
-
-            m = self.RE_NUMER_KONTA.match(ln)
-            if m:
-                numer = m.group(1)
-                reszta = m.group(2)
-                liczby = self.RE_LICZBA_PL.findall(reszta)
-
-                if len(liczby) >= 8:
-                    # Cały wiersz w jednej linii
-                    idx = reszta.find(liczby[0])
-                    nazwa = reszta[:idx].strip() if idx > 0 else ""
-                    zapisz(numer, nazwa, liczby[-2], liczby[-1])
-                    czek_konto = None
-                    czek_nazwa = ""
-                else:
-                    # Wiersz kontynuacyjny - nazwa/liczby w kolejnych liniach
-                    czek_konto = numer
-                    czek_nazwa = reszta
-            elif czek_konto:
-                liczby = self.RE_LICZBA_PL.findall(ln)
-                if len(liczby) >= 8:
-                    # Linia z liczbami dla oczekującego konta
-                    zapisz(czek_konto, czek_nazwa, liczby[-2], liczby[-1])
-                    czek_konto = None
-                    czek_nazwa = ""
-                else:
-                    # Kontynuacja nazwy klienta
-                    czek_nazwa += " " + ln
-
-        # Dla kompatybilności: jeśli mamy syntetykę 130 ale nie analitykę, dodaj ją
-        if "130" in wynik.konta and not any(
-            normalize_konto(k) == "130" for k in wynik.konta_analityki
-        ):
-            wynik.konta_analityki["130"] = wynik.konta["130"]
-
-        logger.info(
-            f"ZOiS (PDF): {len(wynik.konta)} syntetyk, "
-            f"{len(wynik.konta_analityki)} analityk."
-        )
-        return wynik
-
-    def _parsuj_dataframe(self, df: pd.DataFrame, zrodlo: str) -> DaneZOiS:
-        kol_konto = self._znajdz_kolumne(df, self.KOLUMNY_KONTO)
-        kol_nazwa = self._znajdz_kolumne(df, self.KOLUMNY_NAZWA)
-        kol_wn    = self._znajdz_kolumne(df, self.KOLUMNY_SALDO_WN)
-        kol_ma    = self._znajdz_kolumne(df, self.KOLUMNY_SALDO_MA)
-        brakujace = []
-        if not kol_konto: brakujace.append("Konto")
-        if not kol_wn:    brakujace.append("Saldo Wn")
-        if not kol_ma:    brakujace.append("Saldo Ma")
-        if brakujace:
-            raise ValueError(
-                f"Brak kolumn ZOiS ({zrodlo}): {', '.join(brakujace)}. "
-                f"Dostępne: {list(df.columns)}"
-            )
-        wynik = DaneZOiS()
-        for _, w in df.iterrows():
-            numer_raw = w.get(kol_konto)
-            if pd.isna(numer_raw) or not str(numer_raw).strip():
-                continue
-            numer_pelny = str(numer_raw).strip()
-            numer_syn = normalize_konto(numer_pelny)
-            if numer_syn.lower() in {"razem", "suma", "ogółem", "total"}:
-                continue
-            if not re.match(r"^\d+", numer_syn):
-                continue
-            try:
-                wn = normalize_currency(w.get(kol_wn))
-                ma = normalize_currency(w.get(kol_ma))
-            except ValueError as e:
-                logger.warning(f"Pominięto {numer_pelny}: {e}")
-                continue
-            if numer_pelny != numer_syn:
-                iwn, ima = wynik.konta_analityki.get(numer_pelny, (Decimal("0"), Decimal("0")))
-                wynik.konta_analityki[numer_pelny] = (iwn + wn, ima + ma)
-                if kol_nazwa:
-                    opis = w.get(kol_nazwa)
-                    if not pd.isna(opis) and numer_pelny not in wynik.opisy:
-                        wynik.opisy[numer_pelny] = str(opis).strip()
-            iwn, ima = wynik.konta.get(numer_syn, (Decimal("0"), Decimal("0")))
-            wynik.konta[numer_syn] = (iwn + wn, ima + ma)
-            if kol_nazwa and numer_syn not in wynik.opisy:
-                opis = w.get(kol_nazwa)
-                if not pd.isna(opis):
-                    wynik.opisy[numer_syn] = str(opis).strip()
-        if "130" in wynik.konta and not any(
-            normalize_konto(k) == "130" for k in wynik.konta_analityki
-        ):
-            wynik.konta_analityki["130"] = wynik.konta["130"]
-        logger.info(
-            f"ZOiS ({zrodlo}): {len(wynik.konta)} syntetyk, "
-            f"{len(wynik.konta_analityki)} analityk."
-        )
-        return wynik
-
-
-# =============================================================================
-# PARSER BILANSU (v3.0 – pełna obsługa formatu Symfonii)
-# =============================================================================
-
-class ParserBilansu:
-    """
-    Parser Bilansu z Symfonii (wariant pełny).
-
-    Wykrywa:
-      - Sekcje AKTYWA i PASYWA (separator)
-      - Pozycje A, B, C, D (aktywa) i A, B (pasywa)
-      - Suma (pojawia się 2 razy: suma aktywów i suma pasywów)
-      - Wynik netto (pasywa A.VI)
-    """
-
-    # Regex: pozycja A-D + tekst + 3 kwoty (bieżący, ubiegły, różnica)
-    RE_POZ = re.compile(
-        rf"^\s*(?:[+\-*]\s+)?([A-D])\s+.+?\s+({RE_KWOTA})\s+({RE_KWOTA})\s+({RE_KWOTA})\s*$"
-    )
-    # Regex: "Suma" + 3 kwoty
-    RE_SUMA = re.compile(
-        rf"^\s*Suma\s+({RE_KWOTA})\s+({RE_KWOTA})\s+({RE_KWOTA})\s*$"
-    )
-    # Regex: pozycja VI "Zysk (strata) netto" w kapitale własnym pasywów
-    RE_WYNIK_NETTO = re.compile(
-        rf"VI\s+Zysk.+?netto\s+({RE_KWOTA})\s+({RE_KWOTA})\s+({RE_KWOTA})"
-    )
-
-    def parsuj_xlsx(self, dane_binarne: bytes) -> DaneBilansu:
-        """XLSX – próbuje parsować jak tekst."""
-        bufor = io.BytesIO(dane_binarne)
-        try:
-            wb = openpyxl.load_workbook(bufor, data_only=True)
-            wiersze = []
-            for w in wb.active.iter_rows(values_only=True):
-                linia = " ".join(str(k) for k in w if k is not None)
-                wiersze.append(linia)
-        except Exception as e:
-            raise ValueError(f"Błąd odczytu XLSX (Bilans): {e}")
-        return self._parsuj_linie(wiersze)
-
-    def parsuj_pdf(self, dane_binarne: bytes) -> DaneBilansu:
-        """PDF – ekstrahuje tekst i parsuje linia po linii."""
-        if not PDF_AVAILABLE:
-            raise ImportError("Brak pdfplumber.")
-        bufor = io.BytesIO(dane_binarne)
-        wszystkie = []
-        with pdfplumber.open(bufor) as pdf:
-            for strona in pdf.pages:
-                t = dekoduj_cid(strona.extract_text() or "")
-                wszystkie.extend(t.splitlines())
-        return self._parsuj_linie(wszystkie)
-
-    def _parsuj_linie(self, linie: List[str]) -> DaneBilansu:
-        """
-        Główna logika parsowania. Iteruje po liniach śledząc w której sekcji
-        (AKTYWA/PASYWA) się znajdujemy.
-        """
-        wynik = DaneBilansu()
-        tryb: Optional[str] = None  # "A" = aktywa, "P" = pasywa
-        sumy: List[Tuple[str, Decimal, Decimal]] = []  # [(tryb, bieżący, ubiegły)]
-        znalezione_aktywa: Dict[str, Tuple[Decimal, Decimal]] = {}
-        znalezione_pasywa: Dict[str, Tuple[Decimal, Decimal]] = {}
-
-        for linia in linie:
-            # ── Separator sekcji ─────────────────────────────────────────────
-            if "AKTYWA" in linia and "PASYWA" not in linia:
-                tryb = "A"
-                continue
-            if "PASYWA" in linia:
-                tryb = "P"
-                continue
-
-            # ── Wynik netto (A.VI pasywów) ──────────────────────────────────
-            if tryb == "P":
-                m_wn = self.RE_WYNIK_NETTO.search(linia)
-                if m_wn:
-                    try:
-                        wynik.wynik_netto_biezacy = normalize_currency(m_wn.group(1))
-                        wynik.wynik_netto_ubiegly = normalize_currency(m_wn.group(2))
-                    except ValueError:
-                        pass
-
-            # ── Suma (pojawia się 2x: aktywa i pasywa) ───────────────────────
-            m_suma = self.RE_SUMA.match(linia)
-            if m_suma and tryb:
-                try:
-                    b = normalize_currency(m_suma.group(1))
-                    u = normalize_currency(m_suma.group(2))
-                    sumy.append((tryb, b, u))
-                except ValueError:
-                    pass
-                continue
-
-            # ── Pozycja A/B/C/D w aktywach lub A/B w pasywach ────────────────
-            m = self.RE_POZ.match(linia)
-            if m and tryb:
-                lit = m.group(1)
-                try:
-                    b = normalize_currency(m.group(2))
-                    u = normalize_currency(m.group(3))
-                except ValueError:
-                    continue
-
-                target = znalezione_aktywa if tryb == "A" else znalezione_pasywa
-                # "First wins" – pierwsza pozycja wiąże się z główną, kolejne ignorujemy
-                if lit not in target:
-                    target[lit] = (b, u)
-
-        # ── Przepisanie do struktury DaneBilansu ─────────────────────────────
-        if "A" in znalezione_aktywa:
-            wynik.aktywa_trwale_biezacy, wynik.aktywa_trwale_ubiegly = znalezione_aktywa["A"]
-        if "B" in znalezione_aktywa:
-            wynik.aktywa_obrotowe_biezacy, wynik.aktywa_obrotowe_ubiegly = znalezione_aktywa["B"]
-        if "C" in znalezione_aktywa:
-            wynik.nalezne_wplaty_biezacy, wynik.nalezne_wplaty_ubiegly = znalezione_aktywa["C"]
-        if "D" in znalezione_aktywa:
-            wynik.udzialy_wlasne_biezacy, wynik.udzialy_wlasne_ubiegly = znalezione_aktywa["D"]
-
-        if "A" in znalezione_pasywa:
-            wynik.kapital_wlasny_biezacy, wynik.kapital_wlasny_ubiegly = znalezione_pasywa["A"]
-        if "B" in znalezione_pasywa:
-            wynik.zobowiazania_biezacy, wynik.zobowiazania_ubiegly = znalezione_pasywa["B"]
-
-        # Sumy: pierwsza to aktywa, druga to pasywa
-        for tr, b, u in sumy:
-            if tr == "A" and wynik.suma_aktywow_biezacy == Decimal("0"):
-                wynik.suma_aktywow_biezacy = b
-                wynik.suma_aktywow_ubiegly = u
-            elif tr == "P" and wynik.suma_pasywow_biezacy == Decimal("0"):
-                wynik.suma_pasywow_biezacy = b
-                wynik.suma_pasywow_ubiegly = u
-
-        logger.info(
-            f"Bilans: Aktywa={wynik.suma_aktywow_biezacy:,.2f}, "
-            f"Pasywa={wynik.suma_pasywow_biezacy:,.2f}, "
-            f"Wynik netto={wynik.wynik_netto_biezacy:,.2f}"
-        )
-        return wynik
-
-
-# =============================================================================
-# PARSER RACHUNKU ZYSKÓW I STRAT (v3.0 – nowość)
-# =============================================================================
-
-class ParserRZiS:
-    """
-    Parser Rachunku Zysków i Strat (wariant porównawczy).
-
-    Strategia: "last wins" – iteruje po liniach i nadpisuje słownik pozycji.
-    Dzięki temu:
-      - Litery A-H, J, K, L są unikalne (pierwsza = główna)
-      - Litera "I" występuje wielokrotnie jako rzymska cyfra I w podsekcjach
-        (np. "I Amortyzacja" w sekcji B), ale OSTATNIA "I" = główna (Zysk brutto)
-    """
-
-    RE_POZ = re.compile(
-        rf"^\s*(?:[+\-*]\s+)?([A-L])\s+.+?\s+({RE_KWOTA})\s+({RE_KWOTA})\s*$"
-    )
-
-    def parsuj_xlsx(self, dane_binarne: bytes) -> DaneRZiS:
-        bufor = io.BytesIO(dane_binarne)
-        try:
-            wb = openpyxl.load_workbook(bufor, data_only=True)
-            linie = []
-            for w in wb.active.iter_rows(values_only=True):
-                linie.append(" ".join(str(k) for k in w if k is not None))
-        except Exception as e:
-            raise ValueError(f"Błąd odczytu XLSX (RZiS): {e}")
-        return self._parsuj_linie(linie)
-
-    def parsuj_pdf(self, dane_binarne: bytes) -> DaneRZiS:
-        if not PDF_AVAILABLE:
-            raise ImportError("Brak pdfplumber.")
-        bufor = io.BytesIO(dane_binarne)
-        linie = []
-        with pdfplumber.open(bufor) as pdf:
-            for strona in pdf.pages:
-                t = dekoduj_cid(strona.extract_text() or "")
-                linie.extend(t.splitlines())
-        return self._parsuj_linie(linie)
-
-    def _parsuj_linie(self, linie: List[str]) -> DaneRZiS:
-        znalezione: Dict[str, Tuple[Decimal, Decimal]] = {}
-
-        for linia in linie:
-            m = self.RE_POZ.match(linia)
-            if m:
-                lit = m.group(1)
-                try:
-                    b = normalize_currency(m.group(2))
-                    u = normalize_currency(m.group(3))
-                    # "last wins" – ostatnie wystąpienie nadpisuje
-                    znalezione[lit] = (b, u)
-                except ValueError:
-                    continue
-
-        wynik = DaneRZiS()
-        for lit, pole in DaneRZiS.MAPA_POZYCJI.items():
-            if lit in znalezione:
-                setattr(wynik, pole, znalezione[lit])
-
-        logger.info(
-            f"RZiS: Przychody(A)={wynik.przychody_sprzedazy[0]:,.2f}, "
-            f"Koszty(B)={wynik.koszty_operacyjne[0]:,.2f}, "
-            f"Zysk netto(L)={wynik.zysk_netto[0]:,.2f}"
-        )
-        return wynik
-
-
-# =============================================================================
-# PARSER WYCIĄGU BANKOWEGO (bez zmian)
-# =============================================================================
-
-class ParserWyciaguBankowego:
-    KLUCZE_SALDO = [
-        "saldo końcowe", "saldo na koniec", "closing balance",
-        "stan na koniec", "saldo końca okresu",
-    ]
-    WZORZEC_IBAN = re.compile(r"(?:PL)?\s*(\d{2}\s*(?:\d{4}\s*){6})")
-    ZNANE_BANKI = [
-        "Santander", "PKO BP", "PKO Bank", "mBank", "ING Bank", "Pekao",
-        "BNP Paribas", "Millennium", "Credit Agricole", "Alior", "Citi",
-        "Getin", "Nest Bank", "Raiffeisen", "Deutsche Bank", "BOŚ",
-    ]
-
-    def parsuj(self, dane_binarne: bytes, format_pliku: str):
-        if format_pliku.lower() == "pdf":
-            return self._parsuj_pdf(dane_binarne)
-        return self._parsuj_xlsx(dane_binarne)
-
-    def _parsuj_pdf(self, dane_binarne: bytes):
-        if not PDF_AVAILABLE:
-            raise ImportError("Brak pdfplumber.")
-        bufor = io.BytesIO(dane_binarne)
-        saldo = Decimal("0")
-        caly_tekst = ""
-        with pdfplumber.open(bufor) as pdf:
-            for strona in pdf.pages:
-                caly_tekst += dekoduj_cid(strona.extract_text() or "") + "\n"
-            for strona in reversed(pdf.pages):
-                t = dekoduj_cid(strona.extract_text() or "")
-                s = self._wyciagnij_saldo(t)
-                if s and s != Decimal("0"):
-                    saldo = s
-                    break
-        data_op = wykryj_date_ostatniej_operacji(caly_tekst)
-        rok, mies = data_op if data_op else (None, None)
-        return saldo, rok, mies, self._iban(caly_tekst), self._bank(caly_tekst)
-
-    def _parsuj_xlsx(self, dane_binarne: bytes):
-        bufor = io.BytesIO(dane_binarne)
-        try:
-            df = pd.read_excel(bufor, engine="openpyxl", header=None)
-        except Exception as e:
-            raise ValueError(f"Błąd odczytu XLSX wyciągu: {e}")
-        saldo = Decimal("0")
-        caly_tekst = ""
-        for _, wiersz in df.iterrows():
-            for kom in wiersz:
-                if isinstance(kom, str):
-                    caly_tekst += kom + " "
-                    if any(k in kom.lower() for k in self.KLUCZE_SALDO):
-                        for v in wiersz:
-                            try:
-                                kw = normalize_currency(v)
-                                if kw != Decimal("0"):
-                                    saldo = kw
-                                    break
-                            except (ValueError, TypeError):
-                                pass
-                elif kom is not None:
-                    caly_tekst += str(kom) + " "
-        data_op = wykryj_date_ostatniej_operacji(caly_tekst)
-        rok, mies = data_op if data_op else (None, None)
-        return saldo, rok, mies, self._iban(caly_tekst), self._bank(caly_tekst)
-
-    def _wyciagnij_saldo(self, tekst: str):
-        for linia in tekst.splitlines():
-            ll = linia.lower()
-            if any(k in ll for k in self.KLUCZE_SALDO):
-                for token in reversed(linia.split()):
-                    try:
-                        kw = normalize_currency(token)
-                        if kw != Decimal("0"):
-                            return kw
-                    except (ValueError, TypeError):
-                        pass
-        return None
-
-    def _iban(self, tekst: str) -> str:
-        m = self.WZORZEC_IBAN.search(tekst)
-        return re.sub(r"\s+", "", m.group(1)) if m else ""
-
-    def _bank(self, tekst: str) -> str:
-        tl = tekst.lower()
-        for bank in self.ZNANE_BANKI:
-            if bank.lower() in tl:
-                return bank
-        return ""
-
-
-# =============================================================================
-# GŁÓWNA KLASA AUDYTORA
-# =============================================================================
-
-class SymfoniaYearEndAuditor:
-    """
-    Audytor jakości danych – zamknięcie roku v3.0.
-
-    API:
-        parsuj_zois(bytes, format)    → DaneZOiS
-        parsuj_bilans(bytes, format)  → DaneBilansu
-        parsuj_rzis(bytes, format)    → DaneRZiS
-        parsuj_wyciag(konto, bytes, format) → WyciagBankowy
-        check_accounting_logic(...)   → weryfikacja
-        generate_audit_report(...)    → raport
-        run_full_audit(...)           → wszystko w jednym wywołaniu
-    """
-
-    def __init__(self):
-        self._parser_zois   = ParserZOiS()
-        self._parser_bilans = ParserBilansu()
-        self._parser_rzis   = ParserRZiS()
-        self._parser_wyciag = ParserWyciaguBankowego()
-        self._wyniki: List[PunktKontroli] = []
-
-    # ── Publiczne API – parsowanie ──────────────────────────────────────────
-
-    def parsuj_zois(self, dane_binarne: bytes, format_pliku: str = "xlsx") -> DaneZOiS:
-        if format_pliku.lower() == "pdf":
-            return self._parser_zois.parsuj_pdf(dane_binarne)
-        return self._parser_zois.parsuj_xlsx(dane_binarne)
-
-    def parsuj_bilans(self, dane_binarne: bytes, format_pliku: str = "xlsx") -> DaneBilansu:
-        if format_pliku.lower() == "pdf":
-            return self._parser_bilans.parsuj_pdf(dane_binarne)
-        return self._parser_bilans.parsuj_xlsx(dane_binarne)
-
-    def parsuj_rzis(self, dane_binarne: bytes, format_pliku: str = "xlsx") -> DaneRZiS:
-        if format_pliku.lower() == "pdf":
-            return self._parser_rzis.parsuj_pdf(dane_binarne)
-        return self._parser_rzis.parsuj_xlsx(dane_binarne)
-
-    def parsuj_wyciag(
-        self,
-        numer_konta_ksiegowego: str,
-        dane_binarne: bytes,
-        format_pliku: str = "pdf",
-    ) -> WyciagBankowy:
-        saldo, rok, mies, iban, bank = self._parser_wyciag.parsuj(
-            dane_binarne, format_pliku
-        )
-        return WyciagBankowy(
-            numer_konta_ksiegowego=numer_konta_ksiegowego,
-            saldo_koncowe=saldo,
-            rok_ostatniej_operacji=rok,
-            miesiac_ostatniej_operacji=mies,
-            numer_rachunku=iban,
-            bank_nazwa=bank,
-            wgrany_plik=True,
-        )
-
-    # ── Publiczne API – weryfikacja ─────────────────────────────────────────
-
-    def check_accounting_logic(
-        self,
-        dane_zois:   Optional[DaneZOiS],
-        dane_bilans: Optional[DaneBilansu]  = None,
-        dane_rzis:   Optional[DaneRZiS]     = None,
-        wyciagi:     Optional[List[WyciagBankowy]] = None,
-        rok_obrachunkowy: int = 2024,
-    ) -> List[PunktKontroli]:
-        self._wyniki = []
-        wyciagi = wyciagi or []
-
-        # ── ZOiS – konta ────────────────────────────────────────────────────
-        if dane_zois is None:
-            self._wyniki.append(PunktKontroli(
-                konto="ZOiS", punkt="Wczytanie ZOiS", status=StatusAudytu.BRAK,
-                uwagi="Nie dostarczono pliku ZOiS.",
-            ))
-        else:
-            self._weryfikuj_konta_bankowe(dane_zois, wyciagi, rok_obrachunkowy)
-            self._weryfikuj_konto_145(dane_zois)
-            self._weryfikuj_konto_200(dane_zois)
-            self._weryfikuj_konto_202(dane_zois)
-            self._weryfikuj_konto_230(dane_zois)
-            self._weryfikuj_konto_229(dane_zois)
-            self._weryfikuj_konto_220(dane_zois)
-            self._weryfikuj_konto_700(dane_zois)
-            self._weryfikuj_grupe_4(dane_zois)
-
-        # ── Bilans ──────────────────────────────────────────────────────────
-        self._weryfikuj_bilans(dane_bilans)
-
-        # ── RZiS ────────────────────────────────────────────────────────────
-        self._weryfikuj_rzis(dane_rzis)
-
-        # ── Reguły krzyżowe ZOiS ↔ RZiS ↔ Bilans ────────────────────────────
-        self._weryfikuj_krzyzowe(dane_zois, dane_bilans, dane_rzis)
-
-        return self._wyniki
-
-    def generate_audit_report(
-        self,
-        wyniki: List[PunktKontroli],
-        nazwa_podmiotu: str = "Podmiot",
-        rok: int = 2024,
-    ) -> Dict:
-        linia = "═" * 70
-        L = [
-            linia,
-            f"  RAPORT KONTROLI JAKOŚCI DANYCH – ZAMKNIĘCIE ROKU {rok}",
-            f"  Podmiot: {nazwa_podmiotu}",
-            f"  Wygenerowano przez: SymfoniaYearEndAuditor v3.0",
-            linia, "",
-            f"{'ŹRÓDŁO':<14} {'STATUS':<20} {'PUNKT KONTROLI':<42} UWAGI",
-            "─" * 110,
-        ]
-        stats = {s: 0 for s in StatusAudytu}
-        wyniki_slow = []
-        for pkt in wyniki:
-            stats[pkt.status] += 1
-            wartosc = f" [{pkt.wartosc}]" if pkt.wartosc else ""
-            L.append(
-                f"{pkt.konto:<14} {pkt.status.value:<20} "
-                f"{pkt.punkt:<42} {pkt.uwagi}{wartosc}"
-            )
-            wyniki_slow.append({
-                "konto": pkt.konto, "status": pkt.status.value,
-                "punkt": pkt.punkt, "uwagi": pkt.uwagi, "wartosc": pkt.wartosc,
-            })
-
-        bledy = [p for p in wyniki if p.status == StatusAudytu.BLAD]
-        ostrz = [p for p in wyniki if p.status == StatusAudytu.OSTRZEZ]
-        brak  = [p for p in wyniki if p.status == StatusAudytu.BRAK]
-
-        L.extend(["", linia, "  PODSUMOWANIE", linia])
-        L.append(f"  ✅ OK:            {stats[StatusAudytu.OK]}")
-        L.append(f"  ❌ BŁĘDY:         {stats[StatusAudytu.BLAD]}")
-        L.append(f"  ⚠️  OSTRZEŻENIA:  {stats[StatusAudytu.OSTRZEZ]}")
-        L.append(f"  🔍 BRAK DANYCH:  {stats[StatusAudytu.BRAK]}")
-
-        if bledy:
-            L.extend(["", "  ❌ WYMAGANE DZIAŁANIA (BŁĘDY KRYTYCZNE):"])
-            for p in bledy:
-                L.append(f"    → {p.konto}: {p.uwagi}")
-        if ostrz:
-            L.extend(["", "  ⚠️  DO WYJAŚNIENIA (OSTRZEŻENIA):"])
-            for p in ostrz:
-                L.append(f"    → {p.konto}: {p.uwagi}")
-        if brak:
-            L.extend(["", "  🔍 BRAKI DANYCH:"])
-            for p in brak:
-                L.append(f"    → {p.konto}: {p.uwagi}")
-
-        L.append("")
-        if stats[StatusAudytu.BLAD] == 0 and stats[StatusAudytu.OSTRZEZ] == 0:
-            L.append("  🎉 OCENA KOŃCOWA: DANE SPÓJNE – gotowe do badania.")
-        elif stats[StatusAudytu.BLAD] == 0:
-            L.append("  🟡 OCENA KOŃCOWA: WYMAGA WYJAŚNIENIA.")
-        else:
-            L.append("  🔴 OCENA KOŃCOWA: DANE NIESPÓJNE – wymagane korekty.")
-        L.append(linia)
-
-        return {
-            "tekst": "\n".join(L),
-            "wyniki": wyniki_slow,
-            "podsumowanie": {
-                "ok": stats[StatusAudytu.OK],
-                "bledy": stats[StatusAudytu.BLAD],
-                "ostrzezenia": stats[StatusAudytu.OSTRZEZ],
-                "brak_danych": stats[StatusAudytu.BRAK],
-                "podmiot": nazwa_podmiotu,
-                "rok": rok,
-            },
-        }
-
-    def run_full_audit(
-        self,
-        *,
-        zois_bytes:   Optional[bytes] = None,
-        zois_format:  str = "xlsx",
-        bilans_bytes: Optional[bytes] = None,
-        bilans_format: str = "xlsx",
-        rzis_bytes:   Optional[bytes] = None,
-        rzis_format:  str = "pdf",
-        wyciagi: Optional[List[WyciagBankowy]] = None,
-        nazwa_podmiotu: str = "Podmiot",
-        rok: int = 2024,
-    ) -> Dict:
-        dane_zois   = self.parsuj_zois(zois_bytes, zois_format) if zois_bytes else None
-        dane_bilans = self.parsuj_bilans(bilans_bytes, bilans_format) if bilans_bytes else None
-        dane_rzis   = self.parsuj_rzis(rzis_bytes, rzis_format) if rzis_bytes else None
-
-        wyniki = self.check_accounting_logic(
-            dane_zois, dane_bilans, dane_rzis, wyciagi or [],
-            rok_obrachunkowy=rok,
-        )
-        return self.generate_audit_report(wyniki, nazwa_podmiotu, rok)
-
-    # ─── WERYFIKACJA BANK ─────────────────────────────────────────────────────
-
-    def _weryfikuj_konta_bankowe(
-        self,
-        dane_zois: DaneZOiS,
-        wyciagi: List[WyciagBankowy],
-        rok_obrachunkowy: int,
-    ) -> None:
-        konta_bankowe = dane_zois.pobierz_konta_bankowe()
-        if not konta_bankowe:
-            self._wyniki.append(PunktKontroli(
-                konto="130", punkt="Rachunki bankowe",
-                status=StatusAudytu.BRAK,
-                uwagi="CRITICAL: Nie odnaleziono konta 130 w ZOiS.",
-            ))
-            return
-
-        mapa = {w.numer_konta_ksiegowego: w for w in wyciagi}
-        self._wyniki.append(PunktKontroli(
-            konto="130", punkt="Wykryte rachunki bankowe",
-            status=StatusAudytu.INFO,
-            uwagi=f"Wykryto {len(konta_bankowe)} rachunek(ów) w ZOiS, wgrano {len(wyciagi)} wyciąg(ów).",
-        ))
-
-        rachunki_bez_wyciagu = []
-        for numer_ks, opis, saldo_zois in konta_bankowe:
-            wyciag = mapa.get(numer_ks)
-            if wyciag is None:
-                rachunki_bez_wyciagu.append((numer_ks, opis, saldo_zois))
-                self._wyniki.append(PunktKontroli(
-                    konto=numer_ks, punkt=f"Rachunek {opis}",
-                    status=StatusAudytu.BRAK,
-                    uwagi=f"Brak wgranego wyciągu. Saldo ZOiS: {saldo_zois:,.2f} zł.",
-                ))
-                continue
-
-            roznica = abs(saldo_zois - wyciag.saldo_koncowe)
-            okres_info = ""
-            ostrz_okresu = ""
-            if wyciag.miesiac_ostatniej_operacji:
-                okres_info = f" | Ostatnia operacja: {wyciag.okres_opisowy}"
-                if (wyciag.miesiac_ostatniej_operacji != 12 or
-                    (wyciag.rok_ostatniej_operacji and
-                     wyciag.rok_ostatniej_operacji != rok_obrachunkowy)):
-                    ostrz_okresu = (
-                        f" UWAGA: Rachunek zamknięty operacjami z "
-                        f"{wyciag.okres_opisowy}, nie z grudnia {rok_obrachunkowy}."
-                    )
-            bank_str = f" ({wyciag.bank_nazwa})" if wyciag.bank_nazwa else ""
-
-            if roznica < Decimal("0.01"):
-                status = StatusAudytu.OSTRZEZ if ostrz_okresu else StatusAudytu.OK
-                self._wyniki.append(PunktKontroli(
-                    konto=numer_ks, punkt=f"Rachunek {opis}{bank_str}",
-                    status=status,
-                    uwagi=f"Saldo ZOiS zgodne z wyciągiem.{ostrz_okresu}{okres_info}",
-                    wartosc=f"{saldo_zois:,.2f} zł",
-                ))
-            else:
-                self._wyniki.append(PunktKontroli(
-                    konto=numer_ks, punkt=f"Rachunek {opis}{bank_str}",
-                    status=StatusAudytu.BLAD,
-                    uwagi=(f"NIEZGODNOŚĆ: ZOiS={saldo_zois:,.2f} zł | "
-                           f"Wyciąg={wyciag.saldo_koncowe:,.2f} zł | "
-                           f"Różnica={roznica:,.2f} zł.{ostrz_okresu}{okres_info}"),
-                ))
-
-        if rachunki_bez_wyciagu:
-            lista = "; ".join(f"{n} ({o}): {s:,.2f} zł" for n, o, s in rachunki_bez_wyciagu)
-            self._wyniki.append(PunktKontroli(
-                konto="130 (podsum.)",
-                punkt=f"Rachunki bez wgranego wyciągu ({len(rachunki_bez_wyciagu)} szt.)",
-                status=StatusAudytu.OSTRZEZ,
-                uwagi=f"Do uzupełnienia: {lista}",
-            ))
-
-    # ─── WERYFIKACJA POSZCZEGÓLNYCH KONT (jak w v2.0) ─────────────────────────
-
-    def _saldo(self, dane_zois, konto):
-        return dane_zois.konta.get(konto)
-
-    def _znajdz_syntetyki_po_opisie(
-        self,
-        dane_zois: "DaneZOiS",
-        slowa_kluczowe: List[str],
-        grupy_syntetyk: Optional[List[str]] = None,
-    ) -> List[Tuple[str, str, Decimal, Decimal]]:
-        """
-        Wyszukuje syntetyki których opis zawiera któreś ze słów kluczowych.
-
-        Parametry:
-          - slowa_kluczowe: np. ["odbiorc", "klient"]
-          - grupy_syntetyk: opcjonalnie zawężenie do grup ["20", "22"]
-
-        Zwraca listę: (numer_konta, opis, saldo_Wn, saldo_Ma).
-        """
-        wynik = []
-        slowa_lower = [s.lower() for s in slowa_kluczowe]
-        for numer, (wn, ma) in dane_zois.konta.items():
-            # Tylko czyste syntetyki (bez myślnika)
-            if "-" in numer:
-                continue
-            if grupy_syntetyk and not any(numer.startswith(g) for g in grupy_syntetyk):
-                continue
-            opis = dane_zois.opisy.get(numer, "")
-            opis_lower = opis.lower()
-            if any(s in opis_lower for s in slowa_lower):
-                wynik.append((numer, opis, wn, ma))
-        return wynik
-
-    def _znajdz_analityki_po_opisie(
-        self,
-        dane_zois: "DaneZOiS",
-        slowa_kluczowe: List[str],
-        grupy_syntetyk: Optional[List[str]] = None,
-    ) -> List[Tuple[str, str, Decimal, Decimal]]:
-        """
-        Analogicznie do syntetyk, ale szuka w analitykach (konta z myślnikiem).
-        Przykład użycia: szukanie analityki ZUS "220-3" po opisie "ZUS".
-        """
-        wynik = []
-        slowa_lower = [s.lower() for s in slowa_kluczowe]
-        for numer, (wn, ma) in dane_zois.konta_analityki.items():
-            if "-" not in numer:
-                continue
-            numer_syn = normalize_konto(numer)
-            if grupy_syntetyk and not any(numer_syn.startswith(g) for g in grupy_syntetyk):
-                continue
-            opis = dane_zois.opisy.get(numer, "")
-            opis_lower = opis.lower()
-            if any(s in opis_lower for s in slowa_lower):
-                wynik.append((numer, opis, wn, ma))
-        return wynik
-
-    def _weryfikuj_konto_145(self, dane_zois):
-        """
-        Weryfikacja środków pieniężnych w drodze. W różnych planach kont:
-          - 145 (standard)
-          - 133/134 (IGRAPES – "środki w drodze", "rachunek VAT")
-        Saldo powinno wynosić 0 na koniec roku.
-        """
-        # Szukamy po opisie "w drodze" albo "drodze" w grupach 13x/14x
-        kandydaci = self._znajdz_syntetyki_po_opisie(
-            dane_zois, ["w drodze", "drodze"], grupy_syntetyk=["13", "14"]
-        )
-        # Jeśli nie znaleziono po opisie - spróbuj klasyczne 145
-        if not kandydaci:
-            s = self._saldo(dane_zois, "145")
-            if s is None:
-                self._wyniki.append(PunktKontroli(
-                    konto="145", punkt="Środki pieniężne w drodze = 0",
-                    status=StatusAudytu.INFO,
-                    uwagi="Konto środków w drodze nie wystąpiło.",
-                )); return
-            kandydaci = [("145", dane_zois.opisy.get("145", "Środki w drodze"),
-                         s[0], s[1])]
-
-        # Sprawdzamy każde konto z osobna
-        for numer, opis, wn, ma in kandydaci:
-            if wn == Decimal("0") and ma == Decimal("0"):
-                self._wyniki.append(PunktKontroli(
-                    konto=numer, punkt=f"{opis} = 0",
-                    status=StatusAudytu.OK, uwagi="Saldo wynosi 0.",
-                ))
-            else:
-                self._wyniki.append(PunktKontroli(
-                    konto=numer, punkt=f"{opis} = 0",
-                    status=StatusAudytu.BLAD,
-                    uwagi=f"Saldo ≠ 0! Wn={wn:,.2f}, Ma={ma:,.2f} zł.",
-                ))
-
-    def _weryfikuj_konto_200(self, dane_zois):
-        """
-        Rozrachunki z odbiorcami – grupa 20x (np. 200, 201).
-        Wyszukujemy po opisie zawierającym "odbiorc" lub "klient".
-        Oczekiwane saldo: Wn (należności).
-        """
-        kandydaci = self._znajdz_syntetyki_po_opisie(
-            dane_zois, ["odbiorc", "klient"], grupy_syntetyk=["20"]
-        )
-        if not kandydaci:
-            # Fallback: klasyczne 200
-            s = self._saldo(dane_zois, "200")
-            if s is None:
-                self._wyniki.append(PunktKontroli(
-                    konto="20x", punkt="Rozrachunki z odbiorcami",
-                    status=StatusAudytu.BRAK,
-                    uwagi="Brak konta rozrachunków z odbiorcami (20x).",
-                )); return
-            kandydaci = [("200", dane_zois.opisy.get("200", "Rozrachunki - odbiorcy"),
-                         s[0], s[1])]
-
-        for numer, opis, wn, ma in kandydaci:
-            if ma > Decimal("0"):
-                self._wyniki.append(PunktKontroli(
-                    konto=numer, punkt=f"{opis} – strona salda",
-                    status=StatusAudytu.BLAD,
-                    uwagi=f"Saldo Ma={ma:,.2f} zł – BŁĄD. Brak faktury sprzedaży lub nadpłata.",
-                ))
-            else:
-                self._wyniki.append(PunktKontroli(
-                    konto=numer, punkt=f"{opis} – strona salda",
-                    status=StatusAudytu.OK,
-                    uwagi=f"Saldo Wn={wn:,.2f} zł – należności.",
-                ))
-
-    def _weryfikuj_konto_202(self, dane_zois):
-        """
-        Rozrachunki z dostawcami – grupa 20x (np. 202, 210, 211).
-        Wyszukujemy po opisie zawierającym "dostawc".
-        Oczekiwane saldo: Ma (zobowiązania).
-        """
-        kandydaci = self._znajdz_syntetyki_po_opisie(
-            dane_zois, ["dostawc"], grupy_syntetyk=["20", "21"]
-        )
-        if not kandydaci:
-            s = self._saldo(dane_zois, "202")
-            if s is None:
-                self._wyniki.append(PunktKontroli(
-                    konto="20x/21x", punkt="Rozrachunki z dostawcami",
-                    status=StatusAudytu.BRAK,
-                    uwagi="Brak konta rozrachunków z dostawcami.",
-                )); return
-            kandydaci = [("202", dane_zois.opisy.get("202", "Rozrachunki - dostawcy"),
-                         s[0], s[1])]
-
-        for numer, opis, wn, ma in kandydaci:
-            if wn > Decimal("0"):
-                self._wyniki.append(PunktKontroli(
-                    konto=numer, punkt=f"{opis} – strona salda",
-                    status=StatusAudytu.BLAD,
-                    uwagi=f"Saldo Wn={wn:,.2f} zł – BŁĄD. Nadpłata lub brak faktury zakupu.",
-                ))
-            else:
-                self._wyniki.append(PunktKontroli(
-                    konto=numer, punkt=f"{opis} – strona salda",
-                    status=StatusAudytu.OK,
-                    uwagi=f"Saldo Ma={ma:,.2f} zł – zobowiązania.",
-                ))
-
-    def _weryfikuj_konto_230(self, dane_zois):
-        s = self._saldo(dane_zois, "230")
-        if s is None:
-            self._wyniki.append(PunktKontroli(
-                konto="230", punkt="Wynagrodzenia",
-                status=StatusAudytu.INFO, uwagi="Konto 230 nie wystąpiło.",
-            )); return
-        wn, ma = s
-        if wn > Decimal("0"):
-            self._wyniki.append(PunktKontroli(
-                konto="230", punkt="Rozrachunki z pracownikami",
-                status=StatusAudytu.OSTRZEZ,
-                uwagi=f"Saldo Wn={wn:,.2f} zł – brak LP lub nadpłata.",
-            ))
-        elif ma > Decimal("0"):
-            self._wyniki.append(PunktKontroli(
-                konto="230", punkt="Rozrachunki z pracownikami",
-                status=StatusAudytu.OK,
-                uwagi=f"Saldo Ma={ma:,.2f} zł – niezapłacone (dopuszczalne).",
-            ))
-        else:
-            self._wyniki.append(PunktKontroli(
-                konto="230", punkt="Rozrachunki z pracownikami",
-                status=StatusAudytu.OK, uwagi="Saldo 230 = 0.",
-            ))
-
-    def _weryfikuj_konto_229(self, dane_zois):
-        """
-        Zobowiązania ZUS. W różnych planach kont:
-          - 229 (klasyczny standard)
-          - 220-3 w IGRAPES (analityka pod 220 Rozrachunki z budżetami)
-          - 221-x w innych
-        Szuka po opisie "zus" lub "ubezpiecz" w grupach 22x.
-        Oczekiwane saldo: Ma (zobowiązanie).
-        """
-        # Najpierw szukaj w syntetykach
-        kandydaci = self._znajdz_syntetyki_po_opisie(
-            dane_zois, ["zus"], grupy_syntetyk=["22"]
-        )
-        # Potem w analitykach (IGRAPES: 220-3 ZUS)
-        kandydaci_ana = self._znajdz_analityki_po_opisie(
-            dane_zois, ["zus"], grupy_syntetyk=["22"]
-        )
-        # Gdy mamy analityki, eliminujemy duplikat - syntetykę tej samej grupy
-        if kandydaci_ana:
-            syntetyki_do_pominiecia = {
-                normalize_konto(n) for n, _, _, _ in kandydaci_ana
-            }
-            kandydaci = [
-                k for k in kandydaci if k[0] not in syntetyki_do_pominiecia
-            ]
-        kandydaci.extend(kandydaci_ana)
-
-        if not kandydaci:
-            # Fallback: klasyczne 229
-            s = self._saldo(dane_zois, "229")
-            if s is None:
-                self._wyniki.append(PunktKontroli(
-                    konto="ZUS", punkt="Zobowiązanie ZUS",
-                    status=StatusAudytu.BRAK,
-                    uwagi="Brak konta ZUS (229/220-x/ubezpieczeń).",
-                )); return
-            kandydaci = [("229", dane_zois.opisy.get("229", "ZUS"), s[0], s[1])]
-
-        for numer, opis, wn, ma in kandydaci:
-            if wn > Decimal("0"):
-                self._wyniki.append(PunktKontroli(
-                    konto=numer, punkt=f"{opis} – zobowiązanie ZUS",
-                    status=StatusAudytu.OSTRZEZ,
-                    uwagi=f"Saldo Wn={wn:,.2f} zł – nadpłata lub błąd DRA.",
-                ))
-            elif ma > Decimal("0"):
-                self._wyniki.append(PunktKontroli(
-                    konto=numer, punkt=f"{opis} – zobowiązanie ZUS",
-                    status=StatusAudytu.OK,
-                    uwagi=f"Saldo Ma={ma:,.2f} zł. Porównaj z DRA.",
-                ))
-            else:
-                self._wyniki.append(PunktKontroli(
-                    konto=numer, punkt=f"{opis} – zobowiązanie ZUS",
-                    status=StatusAudytu.OK, uwagi="Saldo wynosi 0.",
-                ))
-
-    def _weryfikuj_konto_220(self, dane_zois):
-        """
-        Zobowiązania podatkowe – PIT-4 (podatek od płac) oraz podatek dochodowy.
-        W różnych planach kont:
-          - 220 (klasyczny - cały US)
-          - 220-1 Podatek dochodowy, 220-2 Podatek od płac (IGRAPES)
-          - 222-x (inne systemy)
-        Szuka po opisie "podatek" w grupie 22x (bez ZUS).
-        Oczekiwane saldo: Ma (zobowiązanie podatkowe).
-        """
-        kandydaci = self._znajdz_syntetyki_po_opisie(
-            dane_zois, ["podatek", "budżet", "urz"], grupy_syntetyk=["22"]
-        )
-        kandydaci_ana = self._znajdz_analityki_po_opisie(
-            dane_zois, ["podatek", "pit"], grupy_syntetyk=["22"]
-        )
-        # Wyłącz analityki ZUS (już obsłużone w _weryfikuj_konto_229)
-        kandydaci_ana = [
-            k for k in kandydaci_ana if "zus" not in k[1].lower()
-        ]
-        # Gdy mamy analityki, pomijamy syntetyki tej samej grupy (duplikacja)
-        if kandydaci_ana:
-            syntetyki_do_pominiecia = {
-                normalize_konto(n) for n, _, _, _ in kandydaci_ana
-            }
-            kandydaci = [
-                k for k in kandydaci if k[0] not in syntetyki_do_pominiecia
-            ]
-        kandydaci.extend(kandydaci_ana)
-
-        if not kandydaci:
-            s = self._saldo(dane_zois, "220")
-            if s is None:
-                self._wyniki.append(PunktKontroli(
-                    konto="US/PIT", punkt="Zobowiązanie podatkowe",
-                    status=StatusAudytu.BRAK,
-                    uwagi="Brak konta podatkowego (220/22x).",
-                )); return
-            kandydaci = [("220", dane_zois.opisy.get("220", "US"), s[0], s[1])]
-
-        for numer, opis, wn, ma in kandydaci:
-            if wn > Decimal("0"):
-                self._wyniki.append(PunktKontroli(
-                    konto=numer, punkt=f"{opis} – zobowiązanie podatkowe",
-                    status=StatusAudytu.OSTRZEZ,
-                    uwagi=f"Saldo Wn={wn:,.2f} zł – nadpłata lub brak dekretacji XII.",
-                ))
-            elif ma > Decimal("0"):
-                self._wyniki.append(PunktKontroli(
-                    konto=numer, punkt=f"{opis} – zobowiązanie podatkowe",
-                    status=StatusAudytu.OK,
-                    uwagi=f"Saldo Ma={ma:,.2f} zł. Porównaj z deklaracją PIT-4R/8AR.",
-                ))
-            else:
-                self._wyniki.append(PunktKontroli(
-                    konto=numer, punkt=f"{opis} – zobowiązanie podatkowe",
-                    status=StatusAudytu.OK, uwagi="Saldo wynosi 0.",
-                ))
-
-    def _weryfikuj_konto_700(self, dane_zois):
-        """
-        Weryfikuje konta grupy 70 (przychody ze sprzedaży: 700-709).
-        W praktyce podmioty używają różnych numerów: 700 (Sprzedaż), 701, 702
-        (Sprzedaż usług), 703 (Sprzedaż towarów) itp.
-        """
-        # Sumuj wszystkie konta z grupy 70x (700-709)
-        konta_70 = {
-            k: v for k, v in dane_zois.konta.items()
-            if k.isdigit() and len(k) == 3 and k.startswith("70")
-        }
-        if not konta_70:
-            self._wyniki.append(PunktKontroli(
-                konto="70x", punkt="Przychody ze sprzedaży",
-                status=StatusAudytu.BRAK,
-                uwagi="CRITICAL: Brak kont grupy 70x (700-709).",
-            )); return
-
-        suma_wn = sum((wn for wn, _ in konta_70.values()), Decimal("0"))
-        suma_ma = sum((ma for _, ma in konta_70.values()), Decimal("0"))
-        konta_str = ", ".join(sorted(konta_70.keys()))
-
-        if suma_wn > Decimal("0"):
-            bledne = [k for k, (wn, _) in konta_70.items() if wn > Decimal("0")]
-            self._wyniki.append(PunktKontroli(
-                konto="70x", punkt="Przychody ze sprzedaży – strona salda",
-                status=StatusAudytu.BLAD,
-                uwagi=f"Saldo Wn={suma_wn:,.2f} zł – BŁĄD! "
-                      f"Konta wynikowe Ma. Błędne konta: {', '.join(bledne)}.",
-            ))
-        elif suma_ma > Decimal("0"):
-            self._wyniki.append(PunktKontroli(
-                konto="70x", punkt=f"Przychody ze sprzedaży ({konta_str})",
-                status=StatusAudytu.OK,
-                uwagi=f"Saldo Ma={suma_ma:,.2f} zł – poprawne.",
-                wartosc=f"{suma_ma:,.2f} zł",
-            ))
-        else:
-            self._wyniki.append(PunktKontroli(
-                konto="70x", punkt="Przychody ze sprzedaży",
-                status=StatusAudytu.OSTRZEZ,
-                uwagi="Zerowe salda – brak sprzedaży w okresie?",
-            ))
-
-    def _weryfikuj_grupe_4(self, dane_zois):
-        konta = {k: v for k, v in dane_zois.konta.items() if get_grupa(k) == 4}
-        if not konta:
-            self._wyniki.append(PunktKontroli(
-                konto="Grupa 4", punkt="Koszty rodzajowe (400–499)",
-                status=StatusAudytu.BRAK, uwagi="Brak kont grupy 4.",
-            )); return
-        bledne = []
-        suma = Decimal("0")
-        for k, (wn, ma) in konta.items():
-            suma += wn
-            if ma > Decimal("0"):
-                opis = dane_zois.opisy.get(k, "")
-                bledne.append(f"{k} ({opis}): Ma={ma:,.2f} zł")
-        if bledne:
-            self._wyniki.append(PunktKontroli(
-                konto="Grupa 4", punkt="Koszty rodzajowe – tylko Saldo Wn",
-                status=StatusAudytu.BLAD,
-                uwagi=(f"Konta z Saldem Ma ({len(bledne)} szt.): "
-                       + "; ".join(bledne[:5])
-                       + (" ..." if len(bledne) > 5 else "")),
-            ))
-        else:
-            self._wyniki.append(PunktKontroli(
-                konto="Grupa 4", punkt="Koszty rodzajowe – tylko Saldo Wn",
-                status=StatusAudytu.OK,
-                uwagi=f"Wszystkie {len(konta)} kont poprawne. Suma: {suma:,.2f} zł.",
-            ))
-
-    # ─── WERYFIKACJA BILANSU (v3.0 – rozszerzona) ────────────────────────────
-
-    def _weryfikuj_bilans(self, dane_bilans: Optional[DaneBilansu]):
-        if dane_bilans is None:
-            self._wyniki.append(PunktKontroli(
-                konto="Bilans", punkt="Suma bilansowa",
-                status=StatusAudytu.BRAK, uwagi="Nie dostarczono pliku Bilansu.",
-            )); return
-
-        TOL = Decimal("0.01")
-
-        # 1. Spójność wewnętrzna aktywów: A + B + C + D = Suma aktywów
-        suma_obl_a = (
-            dane_bilans.aktywa_trwale_biezacy + dane_bilans.aktywa_obrotowe_biezacy
-            + dane_bilans.nalezne_wplaty_biezacy + dane_bilans.udzialy_wlasne_biezacy
-        )
-        if dane_bilans.suma_aktywow_biezacy > Decimal("0"):
-            roznica = abs(suma_obl_a - dane_bilans.suma_aktywow_biezacy)
-            if roznica <= TOL:
-                self._wyniki.append(PunktKontroli(
-                    konto="Bilans", punkt="Spójność wewnętrzna aktywów (A+B+C+D=Suma)",
-                    status=StatusAudytu.OK,
-                    uwagi=(f"Aktywa trwałe+obrotowe+C+D = Suma aktywów "
-                           f"({dane_bilans.suma_aktywow_biezacy:,.2f} zł)."),
-                ))
-            else:
-                self._wyniki.append(PunktKontroli(
-                    konto="Bilans", punkt="Spójność wewnętrzna aktywów (A+B+C+D=Suma)",
-                    status=StatusAudytu.BLAD,
-                    uwagi=(f"NIEZGODNOŚĆ! Obliczona suma={suma_obl_a:,.2f}, "
-                           f"Suma w bilansie={dane_bilans.suma_aktywow_biezacy:,.2f} | "
-                           f"Różnica={roznica:,.2f} zł."),
-                ))
-
-        # 2. Spójność wewnętrzna pasywów: A + B = Suma pasywów
-        suma_obl_p = dane_bilans.kapital_wlasny_biezacy + dane_bilans.zobowiazania_biezacy
-        if dane_bilans.suma_pasywow_biezacy > Decimal("0"):
-            roznica = abs(suma_obl_p - dane_bilans.suma_pasywow_biezacy)
-            if roznica <= TOL:
-                self._wyniki.append(PunktKontroli(
-                    konto="Bilans", punkt="Spójność wewnętrzna pasywów (A+B=Suma)",
-                    status=StatusAudytu.OK,
-                    uwagi=(f"Kapitał własny+Zobowiązania = Suma pasywów "
-                           f"({dane_bilans.suma_pasywow_biezacy:,.2f} zł)."),
-                ))
-            else:
-                self._wyniki.append(PunktKontroli(
-                    konto="Bilans", punkt="Spójność wewnętrzna pasywów (A+B=Suma)",
-                    status=StatusAudytu.BLAD,
-                    uwagi=(f"NIEZGODNOŚĆ! Obliczona suma={suma_obl_p:,.2f}, "
-                           f"Suma w bilansie={dane_bilans.suma_pasywow_biezacy:,.2f} | "
-                           f"Różnica={roznica:,.2f} zł."),
-                ))
-
-        # 3. Aktywa = Pasywa (rok bieżący)
-        rb = abs(dane_bilans.suma_aktywow_biezacy - dane_bilans.suma_pasywow_biezacy)
-        if rb <= TOL:
-            self._wyniki.append(PunktKontroli(
-                konto="Bilans", punkt="Suma bilansowa rok bieżący",
-                status=StatusAudytu.OK,
-                uwagi=f"Aktywa = Pasywa = {dane_bilans.suma_aktywow_biezacy:,.2f} zł.",
-            ))
-        else:
-            self._wyniki.append(PunktKontroli(
-                konto="Bilans", punkt="Suma bilansowa rok bieżący",
-                status=StatusAudytu.BLAD,
-                uwagi=(f"NIEZGODNOŚĆ! Aktywa={dane_bilans.suma_aktywow_biezacy:,.2f} ≠ "
-                       f"Pasywa={dane_bilans.suma_pasywow_biezacy:,.2f} | Δ={rb:,.2f} zł."),
-            ))
-
-        # 4. Aktywa = Pasywa (rok ubiegły)
-        if dane_bilans.suma_aktywow_ubiegly > Decimal("0") or dane_bilans.suma_pasywow_ubiegly > Decimal("0"):
-            ru = abs(dane_bilans.suma_aktywow_ubiegly - dane_bilans.suma_pasywow_ubiegly)
-            if ru <= TOL:
-                self._wyniki.append(PunktKontroli(
-                    konto="Bilans", punkt="Suma bilansowa rok ubiegły",
-                    status=StatusAudytu.OK,
-                    uwagi=f"Dane porównawcze: {dane_bilans.suma_aktywow_ubiegly:,.2f} zł.",
-                ))
-            else:
-                self._wyniki.append(PunktKontroli(
-                    konto="Bilans", punkt="Suma bilansowa rok ubiegły",
-                    status=StatusAudytu.BLAD,
-                    uwagi=(f"NIEZGODNOŚĆ! Aktywa={dane_bilans.suma_aktywow_ubiegly:,.2f} ≠ "
-                           f"Pasywa={dane_bilans.suma_pasywow_ubiegly:,.2f} | Δ={ru:,.2f} zł."),
-                ))
-
-    # ─── WERYFIKACJA RZiS (v3.0 – nowa) ──────────────────────────────────────
-
-    def _weryfikuj_rzis(self, dane_rzis: Optional[DaneRZiS]):
-        if dane_rzis is None:
-            self._wyniki.append(PunktKontroli(
-                konto="RZiS", punkt="Rachunek Zysków i Strat",
-                status=StatusAudytu.BRAK, uwagi="Nie dostarczono pliku RZiS.",
-            )); return
-
-        TOL = Decimal("1.00")  # tolerancja 1 zł (zaokrąglenia Symfonii)
-
-        # Sprawdzenia spójności matematycznej RZiS
-        reguly = [
-            ("C = A − B (Zysk ze sprzedaży)",
-             dane_rzis.przychody_sprzedazy[0] - dane_rzis.koszty_operacyjne[0],
-             dane_rzis.zysk_sprzedazy[0]),
-            ("F = C + D − E (Wynik operacyjny)",
-             dane_rzis.zysk_sprzedazy[0]
-              + dane_rzis.pozostale_przych_oper[0]
-              - dane_rzis.pozostale_koszty_oper[0],
-             dane_rzis.zysk_dzialalnosci_oper[0]),
-            ("I = F + G − H (Zysk brutto)",
-             dane_rzis.zysk_dzialalnosci_oper[0]
-              + dane_rzis.przychody_finansowe[0]
-              - dane_rzis.koszty_finansowe[0],
-             dane_rzis.zysk_brutto[0]),
-            ("L = I − J − K (Zysk netto)",
-             dane_rzis.zysk_brutto[0]
-              - dane_rzis.podatek_dochodowy[0]
-              - dane_rzis.pozostale_zmniejszenia[0],
-             dane_rzis.zysk_netto[0]),
-        ]
-
-        for nazwa, obliczona, podana in reguly:
-            roznica = abs(obliczona - podana)
-            if roznica <= TOL:
-                self._wyniki.append(PunktKontroli(
-                    konto="RZiS", punkt=nazwa,
-                    status=StatusAudytu.OK,
-                    uwagi=f"Spójność matematyczna OK ({podana:,.2f} zł).",
-                ))
-            else:
-                self._wyniki.append(PunktKontroli(
-                    konto="RZiS", punkt=nazwa,
-                    status=StatusAudytu.BLAD,
-                    uwagi=(f"NIESPÓJNOŚĆ! Obliczona={obliczona:,.2f}, "
-                           f"Podana={podana:,.2f} | Różnica={roznica:,.2f} zł."),
-                ))
-
-        # Informacyjnie – zysk/strata netto
-        zn = dane_rzis.zysk_netto[0]
-        self._wyniki.append(PunktKontroli(
-            konto="RZiS", punkt="Zysk (strata) netto",
-            status=StatusAudytu.INFO,
-            uwagi=f"Wynik finansowy roku bieżącego: {zn:,.2f} zł.",
-            wartosc=f"{zn:,.2f} zł",
-        ))
-
-    # ─── REGUŁY KRZYŻOWE (v3.0 – nowa) ───────────────────────────────────────
-
-    def _weryfikuj_krzyzowe(
-        self,
-        dane_zois: Optional[DaneZOiS],
-        dane_bilans: Optional[DaneBilansu],
-        dane_rzis: Optional[DaneRZiS],
-    ):
-        """Weryfikacja krzyżowa między ZOiS, Bilansem i RZiS."""
-        TOL = Decimal("1.00")
-
-        # 1. Wynik netto RZiS = Wynik netto w Bilansie (pasywa A.VI)
-        if dane_rzis is not None and dane_bilans is not None:
-            zn_rzis = dane_rzis.zysk_netto[0]
-            zn_bil = dane_bilans.wynik_netto_biezacy
-            if zn_rzis == Decimal("0") and zn_bil == Decimal("0"):
-                pass  # nie mamy danych
-            else:
-                roznica = abs(zn_rzis - zn_bil)
-                if roznica <= TOL:
-                    self._wyniki.append(PunktKontroli(
-                        konto="RZiS↔Bilans",
-                        punkt="Wynik netto: RZiS (L) = Bilans (Pasywa A.VI)",
-                        status=StatusAudytu.OK,
-                        uwagi=f"Wynik netto zgodny: {zn_rzis:,.2f} zł.",
-                    ))
-                else:
-                    self._wyniki.append(PunktKontroli(
-                        konto="RZiS↔Bilans",
-                        punkt="Wynik netto: RZiS (L) = Bilans (Pasywa A.VI)",
-                        status=StatusAudytu.BLAD,
-                        uwagi=(f"NIEZGODNOŚĆ! RZiS={zn_rzis:,.2f} zł, "
-                               f"Bilans={zn_bil:,.2f} zł | Δ={roznica:,.2f} zł."),
-                    ))
-
-        # 2. Grupa 70x (Ma) ≈ RZiS poz. A (Przychody ze sprzedaży)
-        if dane_zois is not None and dane_rzis is not None:
-            konta_70 = {
-                k: v for k, v in dane_zois.konta.items()
-                if k.isdigit() and len(k) == 3 and k.startswith("70")
-            }
-            if konta_70:
-                suma_70_ma = sum((ma for _, ma in konta_70.values()), Decimal("0"))
-                przych = dane_rzis.przychody_sprzedazy[0]
-                konta_str = "+".join(sorted(konta_70.keys()))
-                if przych > Decimal("0") and suma_70_ma > Decimal("0"):
-                    roznica = abs(suma_70_ma - przych)
-                    if roznica <= TOL:
-                        self._wyniki.append(PunktKontroli(
-                            konto="ZOiS↔RZiS",
-                            punkt=f"Grupa 70x (Ma) ≈ RZiS poz. A (Przychody)",
-                            status=StatusAudytu.OK,
-                            uwagi=f"Przychody zgodne ({konta_str}): {suma_70_ma:,.2f} zł.",
-                        ))
-                    else:
-                        self._wyniki.append(PunktKontroli(
-                            konto="ZOiS↔RZiS",
-                            punkt=f"Grupa 70x (Ma) ≈ RZiS poz. A (Przychody)",
-                            status=StatusAudytu.OSTRZEZ,
-                            uwagi=(f"Różnica: ZOiS {konta_str}={suma_70_ma:,.2f} zł, "
-                                   f"RZiS A={przych:,.2f} zł | Δ={roznica:,.2f} zł."),
-                        ))
-
-        # 3. Suma grupy 4 (Wn) ≈ RZiS poz. B (Koszty operacyjne)
-        if dane_zois is not None and dane_rzis is not None:
-            grupa_4_wn = sum(
-                (wn for k, (wn, _) in dane_zois.konta.items() if get_grupa(k) == 4),
-                Decimal("0")
-            )
-            koszty_b = dane_rzis.koszty_operacyjne[0]
-            if grupa_4_wn > Decimal("0") and koszty_b > Decimal("0"):
-                roznica = abs(grupa_4_wn - koszty_b)
-                if roznica <= TOL:
-                    self._wyniki.append(PunktKontroli(
-                        konto="ZOiS↔RZiS",
-                        punkt="Suma grupy 4 (Wn) ≈ RZiS poz. B (Koszty)",
-                        status=StatusAudytu.OK,
-                        uwagi=f"Koszty operacyjne zgodne: {koszty_b:,.2f} zł.",
-                    ))
-                else:
-                    self._wyniki.append(PunktKontroli(
-                        konto="ZOiS↔RZiS",
-                        punkt="Suma grupy 4 (Wn) ≈ RZiS poz. B (Koszty)",
-                        status=StatusAudytu.OSTRZEZ,
-                        uwagi=(f"Różnica: ZOiS grupa 4={grupa_4_wn:,.2f} zł, "
-                               f"RZiS B={koszty_b:,.2f} zł | Δ={roznica:,.2f} zł. "
-                               "Sprawdź amortyzację i pozostałe pozycje."),
-                    ))
-
-
-# =============================================================================
-# TRYB TESTOWY
-# =============================================================================
-
-if __name__ == "__main__":
-    import sys
-
-    print("=" * 70)
-    print("  SymfoniaYearEndAuditor v3.0 – Tryb Testowy")
-    print("  Test parsowania Bilansu + RZiS (rzeczywiste pliki Symfonia)")
-    print("=" * 70)
-
-    sciezka_bilans = "/mnt/user-data/uploads/Bilans.pdf"
-    sciezka_rzis = "/mnt/user-data/uploads/RZIS.pdf"
-
-    audytor = SymfoniaYearEndAuditor()
-
-    print("\n→ Parsowanie Bilansu...")
-    with open(sciezka_bilans, "rb") as f:
-        dane_bilans = audytor.parsuj_bilans(f.read(), "pdf")
-    print(f"  Suma aktywów:  {dane_bilans.suma_aktywow_biezacy:,.2f}")
-    print(f"  Suma pasywów:  {dane_bilans.suma_pasywow_biezacy:,.2f}")
-    print(f"  Wynik netto:   {dane_bilans.wynik_netto_biezacy:,.2f}")
-
-    print("\n→ Parsowanie RZiS...")
-    with open(sciezka_rzis, "rb") as f:
-        dane_rzis = audytor.parsuj_rzis(f.read(), "pdf")
-    print(f"  A. Przychody:       {dane_rzis.przychody_sprzedazy[0]:,.2f}")
-    print(f"  B. Koszty oper.:    {dane_rzis.koszty_operacyjne[0]:,.2f}")
-    print(f"  L. Zysk netto:      {dane_rzis.zysk_netto[0]:,.2f}")
-
-    # Mock ZOiS do testowania krzyżowych reguł
-    dz = DaneZOiS()
-    dz.konta_analityki = {"130-1": (Decimal("179559.96"), Decimal("0"))}
-    dz.konta = {
-        "130": (Decimal("179559.96"), Decimal("0")),
-        "145": (Decimal("0"), Decimal("0")),
-        "200": (Decimal("201405.89"), Decimal("0")),
-        "400": (Decimal("24679.19"), Decimal("0")),
-        "401": (Decimal("358515.66"), Decimal("0")),
-        "402": (Decimal("415178.98"), Decimal("0")),
-        "403": (Decimal("73161.89"), Decimal("0")),
-        "404": (Decimal("1455.89"), Decimal("0")),
-        "405": (Decimal("37380.00"), Decimal("0")),
-        "406": (Decimal("75366.88"), Decimal("0")),
-        "700": (Decimal("0"), Decimal("1114621.54")),  # poprawne: Ma = przychody
+def pobierz_format(plik) -> str:
+    if plik is None:
+        return "xlsx"
+    return "pdf" if plik.name.lower().endswith(".pdf") else "xlsx"
+
+
+def renderuj_wynik(wynik: dict):
+    mapa = {
+        "✅ OK":            ("ok",      "✅"),
+        "❌ BŁĄD":          ("blad",    "❌"),
+        "⚠️  OSTRZEŻENIE":  ("ostrzez", "⚠️"),
+        "🔍 BRAK DANYCH":   ("brak",    "🔍"),
+        "ℹ️  INFO":          ("info",    "ℹ️"),
     }
-    dz.opisy = {"130-1": "Santander"}
-
-    wyciagi = [WyciagBankowy(
-        numer_konta_ksiegowego="130-1",
-        saldo_koncowe=Decimal("179559.96"),
-        rok_ostatniej_operacji=2024, miesiac_ostatniej_operacji=12,
-        bank_nazwa="Santander",
-    )]
-
-    wyniki = audytor.check_accounting_logic(dz, dane_bilans, dane_rzis, wyciagi, 2024)
-    raport = audytor.generate_audit_report(
-        wyniki, nazwa_podmiotu="Abacus Centrum Księgowe SP. z o.o.", rok=2024
+    klasa, ikona = mapa.get(wynik["status"], ("info", "ℹ️"))
+    wartosc_html = (
+        f'<span style="font-size:0.78rem;color:#4b5563;margin-left:6px;">'
+        f'[{wynik["wartosc"]}]</span>' if wynik.get("wartosc") else ""
     )
-    print("\n" + raport["tekst"])
+    st.markdown(f"""
+    <div class="wynik-row {klasa}">
+        <div class="wynik-icon">{ikona}</div>
+        <div class="wynik-content">
+            <div class="konto-label">Konto {wynik["konto"]}</div>
+            <div class="punkt-text">{wynik["punkt"]}{wartosc_html}</div>
+            <div class="uwagi-text">{wynik["uwagi"]}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# =============================================================================
+# ETAP 1 – WGRANIE I ANALIZA ZOiS
+# =============================================================================
+
+if st.session_state["etap"] == 1:
+    st.markdown('<div class="section-title">Etap 1 · Wgranie Zestawienia Obrotów i Sald</div>',
+                unsafe_allow_html=True)
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.markdown("""
+        **Wgraj sprawozdania finansowe z Symfonii:**
+
+        1. **ZOiS** – Zestawienie Obrotów i Sald (wymagane)
+        2. **Bilans** – struktura aktywów/pasywów + wynik netto
+        3. **RZiS** – Rachunek Zysków i Strat (wariant porównawczy)
+
+        System porówna je krzyżowo i wykryje wszystkie rachunki bankowe
+        (analityki konta 130) do uzupełnienia w następnym kroku.
+        """)
+
+        plik_zois = st.file_uploader(
+            "📋 Zestawienie Obrotów i Sald (XLSX lub PDF)",
+            type=["xlsx", "xls", "pdf"],
+            key="upload_zois",
+        )
+
+        plik_bilans = st.file_uploader(
+            "📊 Bilans (XLSX lub PDF)",
+            type=["xlsx", "xls", "pdf"],
+            key="upload_bilans",
+        )
+
+        plik_rzis = st.file_uploader(
+            "📈 Rachunek Zysków i Strat (XLSX lub PDF)",
+            type=["xlsx", "xls", "pdf"],
+            key="upload_rzis",
+        )
+
+        tryb_testowy = st.checkbox(
+            "🧪 Tryb testowy (dane syntetyczne)",
+            help="3 rachunki bankowe: Santander (grudzień), mBank (kwiecień), PKO (bez wyciągu)."
+        )
+
+        if st.button(
+            "🔍 Analizuj sprawozdania →",
+            type="primary",
+            use_container_width=True,
+            disabled=(not tryb_testowy and plik_zois is None),
+        ):
+            audytor = SymfoniaYearEndAuditor()
+
+            try:
+                if tryb_testowy:
+                    # Dane testowe z 3 rachunkami
+                    dz = DaneZOiS()
+                    dz.konta_analityki = {
+                        "130-1": (Decimal("125000.00"), Decimal("0")),
+                        "130-2": (Decimal("3500.00"),   Decimal("0")),
+                        "130-3": (Decimal("18000.00"),  Decimal("0")),
+                    }
+                    dz.konta = {
+                        "130":  (Decimal("146500.00"), Decimal("0")),
+                        "145":  (Decimal("0"),         Decimal("0")),
+                        "200":  (Decimal("12000.00"),  Decimal("0")),
+                        "202":  (Decimal("0"),         Decimal("8750.00")),
+                        "400":  (Decimal("45000.00"),  Decimal("0")),
+                        "700":  (Decimal("0"),         Decimal("210000.00")),
+                    }
+                    dz.opisy = {
+                        "130-1": "Santander – rachunek główny",
+                        "130-2": "mBank – rachunek pomocniczy",
+                        "130-3": "PKO BP – rachunek walutowy USD",
+                    }
+                    st.session_state["dane_zois"] = dz
+                    st.session_state["dane_bilans"] = DaneBilansu(
+                        aktywa_trwale_biezacy=Decimal("50000.00"),
+                        aktywa_obrotowe_biezacy=Decimal("300000.00"),
+                        kapital_wlasny_biezacy=Decimal("140000.00"),
+                        zobowiazania_biezacy=Decimal("210000.00"),
+                        suma_aktywow_biezacy=Decimal("350000.00"),
+                        suma_pasywow_biezacy=Decimal("350000.00"),
+                        wynik_netto_biezacy=Decimal("45000.00"),
+                    )
+                    st.session_state["dane_rzis"] = DaneRZiS(
+                        przychody_sprzedazy=(Decimal("210000.00"), Decimal("180000.00")),
+                        koszty_operacyjne=(Decimal("145000.00"), Decimal("120000.00")),
+                        zysk_sprzedazy=(Decimal("65000.00"), Decimal("60000.00")),
+                        zysk_dzialalnosci_oper=(Decimal("65000.00"), Decimal("60000.00")),
+                        zysk_brutto=(Decimal("65000.00"), Decimal("60000.00")),
+                        podatek_dochodowy=(Decimal("20000.00"), Decimal("15000.00")),
+                        zysk_netto=(Decimal("45000.00"), Decimal("45000.00")),
+                    )
+                    st.session_state["tryb_testowy"] = True
+                else:
+                    # Parsowanie prawdziwego ZOiS
+                    dz = audytor.parsuj_zois(plik_zois.read(), pobierz_format(plik_zois))
+                    st.session_state["dane_zois"] = dz
+                    st.session_state["tryb_testowy"] = False
+
+                    # Bilans (opcjonalnie)
+                    if plik_bilans:
+                        db = audytor.parsuj_bilans(plik_bilans.read(), pobierz_format(plik_bilans))
+                        st.session_state["dane_bilans"] = db
+                    else:
+                        st.session_state["dane_bilans"] = None
+
+                    # RZiS (opcjonalnie)
+                    if plik_rzis:
+                        dr = audytor.parsuj_rzis(plik_rzis.read(), pobierz_format(plik_rzis))
+                        st.session_state["dane_rzis"] = dr
+                    else:
+                        st.session_state["dane_rzis"] = None
+
+                # Wykrycie rachunków
+                st.session_state["konta_bankowe"] = dz.pobierz_konta_bankowe()
+                st.session_state["etap"] = 2
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"❌ Błąd parsowania: {e}")
+
+    with col2:
+        st.markdown("""
+        <div class="metric-card" style="text-align:left;">
+            <div style="font-weight:700; font-size:0.95rem; color:#1b2d45; margin-bottom:10px;">
+                💡 Co robi ten etap?
+            </div>
+            <div style="font-size:0.82rem; color:#4b5563; line-height:1.5;">
+                System przetwarza trzy sprawozdania:
+                <ul style="margin:8px 0 0 0; padding-left:18px;">
+                    <li><strong>ZOiS</strong> → konta syntetyczne + analityki (130-X)</li>
+                    <li><strong>Bilans</strong> → aktywa, pasywa, wynik netto</li>
+                    <li><strong>RZiS</strong> → pozycje A-L (wariant porównawczy)</li>
+                </ul>
+                Po przetworzeniu przejdziemy do etapu wyciągów bankowych.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# =============================================================================
+# ETAP 2 – UZUPEŁNIENIE WYCIĄGÓW PER RACHUNEK
+# =============================================================================
+
+elif st.session_state["etap"] == 2:
+    konta_bankowe = st.session_state.get("konta_bankowe", [])
+    wyciagi_dict = st.session_state.get("wyciagi", {})
+
+    st.markdown(
+        f'<div class="section-title">Etap 2 · Wyciągi bankowe '
+        f'({len(konta_bankowe)} rachunek{"ów" if len(konta_bankowe) != 1 else ""})</div>',
+        unsafe_allow_html=True
+    )
+
+    if not konta_bankowe:
+        st.warning(
+            "⚠️ Nie wykryto rachunków bankowych w ZOiS (brak konta 130). "
+            "Możesz pominąć ten etap."
+        )
+    else:
+        st.markdown(f"""
+        **Wykryto {len(konta_bankowe)} rachunek(ów) bankowych w ZOiS.**
+        Dla każdego rachunku wgraj wyciąg lub wpisz saldo ręcznie.
+        Rachunki bez wyciągu zostaną oznaczone w raporcie.
+
+        💡 *Jeśli ostatnia operacja na rachunku była przed grudniem – system to wykryje
+        i wskaże ten fakt w raporcie (np. „rachunek zamknięty operacjami z kwietnia").*
+        """)
+
+        audytor = SymfoniaYearEndAuditor()
+
+        for numer_ks, opis, saldo_zois in konta_bankowe:
+            # Sprawdź czy rachunek ma już uzupełniony wyciąg
+            w_istniejacy = wyciagi_dict.get(numer_ks)
+            klasa = "uzupelniony" if w_istniejacy else "brak"
+
+            with st.container():
+                st.markdown(f"""
+                <div class="rachunek-card {klasa}">
+                    <div class="rachunek-header">
+                        <div class="rachunek-number">🏦 Konto {numer_ks}</div>
+                        <div class="rachunek-saldo">Saldo ZOiS: {saldo_zois:,.2f} zł</div>
+                    </div>
+                    <div class="rachunek-opis">{opis}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                col_u, col_r = st.columns([1, 1])
+
+                # ── Wariant A: wgranie wyciągu ───────────────────────────────
+                with col_u:
+                    st.markdown("**Wariant A:** Wgraj wyciąg bankowy")
+                    plik_w = st.file_uploader(
+                        "Wyciąg (PDF/XLSX)",
+                        type=["pdf", "xlsx", "xls"],
+                        key=f"w_{numer_ks}",
+                        label_visibility="collapsed",
+                    )
+                    if plik_w:
+                        if st.button(
+                            f"📄 Parsuj wyciąg dla {numer_ks}",
+                            key=f"btn_p_{numer_ks}",
+                            use_container_width=True,
+                        ):
+                            try:
+                                w = audytor.parsuj_wyciag(
+                                    numer_konta_ksiegowego=numer_ks,
+                                    dane_binarne=plik_w.read(),
+                                    format_pliku=pobierz_format(plik_w),
+                                )
+                                wyciagi_dict[numer_ks] = w
+                                st.session_state["wyciagi"] = wyciagi_dict
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Błąd parsowania: {e}")
+
+                # ── Wariant B: ręczne saldo ──────────────────────────────────
+                with col_r:
+                    st.markdown("**Wariant B:** Wpisz ręcznie")
+
+                    rc1, rc2, rc3 = st.columns([2, 2, 1])
+                    with rc1:
+                        saldo_txt = st.text_input(
+                            "Saldo końcowe (zł)",
+                            key=f"s_{numer_ks}",
+                            placeholder="np. 125 000,00",
+                            label_visibility="collapsed",
+                        )
+                    with rc2:
+                        miesiac = st.selectbox(
+                            "Miesiąc ostatniej op.",
+                            options=[
+                                (None, "—"), (1, "styczeń"), (2, "luty"),
+                                (3, "marzec"), (4, "kwiecień"), (5, "maj"),
+                                (6, "czerwiec"), (7, "lipiec"), (8, "sierpień"),
+                                (9, "wrzesień"), (10, "październik"),
+                                (11, "listopad"), (12, "grudzień"),
+                            ],
+                            format_func=lambda x: x[1],
+                            key=f"m_{numer_ks}",
+                            index=12,  # domyślnie grudzień
+                            label_visibility="collapsed",
+                        )
+                    with rc3:
+                        if st.button(
+                            "✓",
+                            key=f"btn_r_{numer_ks}",
+                            use_container_width=True,
+                            help="Zapisz ręcznie wpisane dane",
+                        ):
+                            try:
+                                saldo = normalize_currency(saldo_txt) if saldo_txt else Decimal("0")
+                                wyciagi_dict[numer_ks] = WyciagBankowy(
+                                    numer_konta_ksiegowego=numer_ks,
+                                    saldo_koncowe=saldo,
+                                    rok_ostatniej_operacji=st.session_state["rok"],
+                                    miesiac_ostatniej_operacji=miesiac[0] if miesiac[0] else None,
+                                    wgrany_plik=False,
+                                )
+                                st.session_state["wyciagi"] = wyciagi_dict
+                                st.rerun()
+                            except ValueError:
+                                st.error("Niepoprawne saldo")
+
+                # ── Status rachunku ──────────────────────────────────────────
+                if w_istniejacy:
+                    okres = w_istniejacy.okres_opisowy
+                    zrodlo = "📄 z wyciągu" if w_istniejacy.wgrany_plik else "✏️ ręcznie"
+                    bank_info = f" · {w_istniejacy.bank_nazwa}" if w_istniejacy.bank_nazwa else ""
+
+                    # Czy saldo się zgadza?
+                    roznica = abs(saldo_zois - w_istniejacy.saldo_koncowe)
+                    if roznica < Decimal("0.01"):
+                        status_saldo = "✅ Saldo zgodne"
+                        kolor = "#16a34a"
+                    else:
+                        status_saldo = f"❌ Różnica: {roznica:,.2f} zł"
+                        kolor = "#dc2626"
+
+                    st.markdown(f"""
+                    <div style="background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px;
+                                padding:8px 12px; margin:8px 0; font-size:0.83rem;">
+                        <strong>Uzupełniono {zrodlo}:</strong>
+                        Saldo wyciągu: <strong>{w_istniejacy.saldo_koncowe:,.2f} zł</strong>
+                        &middot; Okres: <strong>{okres}</strong>{bank_info}
+                        &middot; <span style="color:{kolor}; font-weight:600;">{status_saldo}</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    if st.button(f"🗑 Usuń", key=f"del_{numer_ks}"):
+                        del wyciagi_dict[numer_ks]
+                        st.session_state["wyciagi"] = wyciagi_dict
+                        st.rerun()
+
+                st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Akcje końcowe etapu 2 ────────────────────────────────────────────────
+    st.markdown("---")
+
+    kol_a, kol_b, kol_c = st.columns([1, 1, 1])
+
+    with kol_a:
+        if st.button("← Cofnij do ZOiS", use_container_width=True):
+            st.session_state["etap"] = 1
+            st.rerun()
+
+    with kol_b:
+        liczba_uzup = len(wyciagi_dict)
+        liczba_braku = len(konta_bankowe) - liczba_uzup
+        st.info(
+            f"✔ Uzupełniono: **{liczba_uzup}/{len(konta_bankowe)}** "
+            f"| Brak: **{liczba_braku}**"
+        )
+
+    with kol_c:
+        if st.button(
+            "🚀 Uruchom audyt →",
+            type="primary",
+            use_container_width=True,
+        ):
+            # Uruchomienie pełnego audytu
+            audytor = SymfoniaYearEndAuditor()
+            try:
+                wyniki = audytor.check_accounting_logic(
+                    dane_zois=st.session_state["dane_zois"],
+                    dane_bilans=st.session_state.get("dane_bilans"),
+                    dane_rzis=st.session_state.get("dane_rzis"),
+                    wyciagi=list(wyciagi_dict.values()),
+                    rok_obrachunkowy=st.session_state["rok"],
+                )
+                raport = audytor.generate_audit_report(
+                    wyniki,
+                    nazwa_podmiotu=st.session_state.get("nazwa_podmiotu")
+                                   or "Podmiot (nieznany)",
+                    rok=st.session_state["rok"],
+                )
+                st.session_state["raport"] = raport
+                st.session_state["etap"] = 3
+                st.rerun()
+            except Exception as e:
+                st.error(f"Błąd: {e}")
+
+
+# =============================================================================
+# ETAP 3 – RAPORT
+# =============================================================================
+
+elif st.session_state["etap"] == 3:
+    raport = st.session_state["raport"]
+    podsum = raport["podsumowanie"]
+    wyniki = raport["wyniki"]
+    podmiot = podsum["podmiot"]
+    rok_disp = podsum["rok"]
+
+    st.markdown(
+        f'<div class="section-title">Wyniki audytu · {podmiot} · {rok_disp}</div>',
+        unsafe_allow_html=True
+    )
+
+    # Metryki
+    k1, k2, k3, k4 = st.columns(4)
+    for kol, (n, v, etykieta) in zip(
+        [k1, k2, k3, k4],
+        [
+            ("metric-ok",   podsum["ok"],          "✅ Poprawnych"),
+            ("metric-blad", podsum["bledy"],       "❌ Błędów"),
+            ("metric-warn", podsum["ostrzezenia"], "⚠️ Ostrzeżeń"),
+            ("metric-brak", podsum["brak_danych"], "🔍 Brak danych"),
+        ]
+    ):
+        with kol:
+            st.markdown(f"""
+            <div class="metric-card {n}">
+                <div class="metric-value">{v}</div>
+                <div class="metric-label">{etykieta}</div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Ocena końcowa
+    if podsum["bledy"] == 0 and podsum["ostrzezenia"] == 0:
+        kl, tk = "ocena-ok", "🎉 DANE SPÓJNE – gotowe do badania sprawozdania."
+    elif podsum["bledy"] == 0:
+        kl, tk = "ocena-warn", "🟡 WYMAGA WYJAŚNIENIA – ostrzeżenia do weryfikacji."
+    else:
+        kl, tk = "ocena-blad", "🔴 DANE NIESPÓJNE – wymagane korekty."
+
+    st.markdown(f'<div class="ocena-banner {kl}">{tk}</div>', unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Tabela + panel boczny
+    col_l, col_r = st.columns([2, 1])
+
+    with col_l:
+        st.markdown('<div class="section-title">Szczegółowe wyniki</div>',
+                    unsafe_allow_html=True)
+
+        f1, f2 = st.columns([3, 1])
+        with f1:
+            filtr = st.multiselect(
+                "Status",
+                options=["✅ OK", "❌ BŁĄD", "⚠️  OSTRZEŻENIE", "🔍 BRAK DANYCH", "ℹ️  INFO"],
+                default=["❌ BŁĄD", "⚠️  OSTRZEŻENIE", "🔍 BRAK DANYCH"],
+                label_visibility="collapsed",
+            )
+        with f2:
+            wsz = st.checkbox("Wszystkie", value=False)
+
+        do_pokazania = wyniki if wsz else [w for w in wyniki if w["status"] in filtr]
+
+        if not do_pokazania:
+            st.success("Brak wyników dla wybranych filtrów.")
+        else:
+            for w in do_pokazania:
+                renderuj_wynik(w)
+
+    with col_r:
+        st.markdown('<div class="section-title">Eksport</div>', unsafe_allow_html=True)
+
+        # TXT
+        st.download_button(
+            label="⬇️ Raport TXT",
+            data=raport["tekst"].encode("utf-8"),
+            file_name=f"audyt_{podmiot.replace(' ', '_')}_{rok_disp}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+        # CSV
+        df_eks = pd.DataFrame(wyniki)[["konto", "status", "punkt", "uwagi", "wartosc"]]
+        df_eks.columns = ["Konto", "Status", "Punkt", "Uwagi", "Wartość"]
+        csv = df_eks.to_csv(index=False, sep=";", encoding="utf-8-sig")
+        st.download_button(
+            label="⬇️ Wyniki CSV",
+            data=csv.encode("utf-8"),
+            file_name=f"audyt_{podmiot.replace(' ', '_')}_{rok_disp}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        # Wykres
+        try:
+            import plotly.graph_objects as go
+            total = sum([podsum["ok"], podsum["bledy"],
+                         podsum["ostrzezenia"], podsum["brak_danych"]])
+            if total > 0:
+                fig = go.Figure(data=[go.Pie(
+                    labels=["OK", "Błędy", "Ostrzeżenia", "Brak"],
+                    values=[podsum["ok"], podsum["bledy"],
+                            podsum["ostrzezenia"], podsum["brak_danych"]],
+                    marker_colors=["#22c55e", "#ef4444", "#f59e0b", "#94a3b8"],
+                    hole=0.55, textinfo="percent", showlegend=False,
+                )])
+                fig.update_layout(
+                    margin=dict(t=10, b=10, l=10, r=10), height=220,
+                    paper_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        except ImportError:
+            pass
+
+        with st.expander("📄 Raport tekstowy"):
+            st.text(raport["tekst"])
+
+        st.markdown("---")
+        if st.button("↻ Wróć do wyciągów", use_container_width=True):
+            st.session_state["etap"] = 2
+            st.rerun()
