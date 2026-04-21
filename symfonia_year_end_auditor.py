@@ -654,17 +654,158 @@ class ParserBilansu:
     )
 
     def parsuj_xlsx(self, dane_binarne: bytes) -> DaneBilansu:
-        """XLSX – próbuje parsować jak tekst."""
+        """
+        Parser XLSX dla Bilansu (wariant pełny).
+
+        Symfonia eksportuje XLSX ze scalonymi komórkami gdzie litera pozycji
+        (A-D) jest w jednej komórce, a liczby w dalekich kolumnach, z pustymi
+        komórkami pomiędzy. Klasyczne " ".join() zamienia to na ciąg trudny
+        do sparsowania regexem.
+
+        Strategia: iterujemy po każdym wierszu i:
+          1. Wykrywamy sekcję (AKTYWA / PASYWA)
+          2. W wierszu szukamy komórki z pojedynczą literą A-D (pozycja główna)
+             lub oznaczeniem "VI" (wynik netto A.VI pasywów) lub słowem "Suma"
+          3. Bierzemy wszystkie liczbowe wartości z kolejnych komórek
+          4. Z układu "bieżący | odchylenie | ubiegły | odchylenie | różnica"
+             bierzemy liczby [0] i [2]
+        """
         bufor = io.BytesIO(dane_binarne)
         try:
             wb = openpyxl.load_workbook(bufor, data_only=True)
-            wiersze = []
-            for w in wb.active.iter_rows(values_only=True):
-                linia = " ".join(str(k) for k in w if k is not None)
-                wiersze.append(linia)
         except Exception as e:
             raise ValueError(f"Błąd odczytu XLSX (Bilans): {e}")
-        return self._parsuj_linie(wiersze)
+
+        wynik = DaneBilansu()
+        tryb: Optional[str] = None  # "A" = aktywa, "P" = pasywa
+        znalezione_aktywa: Dict[str, Tuple[Decimal, Decimal]] = {}
+        znalezione_pasywa: Dict[str, Tuple[Decimal, Decimal]] = {}
+        sumy: List[Tuple[str, Decimal, Decimal]] = []
+
+        def wyciagnij_liczby(kom_list) -> List[Decimal]:
+            """Z listy komórek zwraca listę liczb (pomija puste i teksty)."""
+            liczby: List[Decimal] = []
+            for kom in kom_list:
+                if kom is None or kom == "":
+                    continue
+                if isinstance(kom, (int, float)):
+                    try:
+                        liczby.append(Decimal(str(round(float(kom), 2))))
+                    except (ValueError, InvalidOperation):
+                        pass
+                else:
+                    tekst_kom = str(kom).strip()
+                    if re.match(r"^-?[\d\s.,]+$", tekst_kom):
+                        try:
+                            liczby.append(normalize_currency(tekst_kom))
+                        except ValueError:
+                            pass
+            return liczby
+
+        def bierz_biezacy_ubiegly(liczby: List[Decimal]) -> Optional[Tuple[Decimal, Decimal]]:
+            """Z listy liczb wyciąga (bieżący, ubiegły) pomijając odchylenia."""
+            if len(liczby) >= 3:
+                return (liczby[0], liczby[2])
+            if len(liczby) >= 2:
+                return (liczby[0], liczby[1])
+            return None
+
+        for w in wb.active.iter_rows(values_only=True):
+            # ── Wykrywanie sekcji AKTYWA/PASYWA ──────────────────────────────
+            # Nagłówek sekcji to wiersz w którym jest TYLKO słowo AKTYWA lub PASYWA
+            # (reszta komórek pusta). W samej treści pozycji też występują słowa
+            # typu "Aktywa trwałe", "Aktywa obrotowe" – nie mogą one przesuwać
+            # trybu bo wtedy gubimy pozycje.
+            niepuste = [str(k).strip() for k in w if k is not None and str(k).strip()]
+            if niepuste == ["AKTYWA"]:
+                tryb = "A"
+                continue
+            if niepuste == ["PASYWA"]:
+                tryb = "P"
+                continue
+
+            # ── "Suma" – pojawia się 2x (aktywa, pasywa) ─────────────────────
+            for i, kom in enumerate(w):
+                if kom is None:
+                    continue
+                if str(kom).strip().lower() == "suma":
+                    liczby = wyciagnij_liczby(w[i + 1:])
+                    para = bierz_biezacy_ubiegly(liczby)
+                    if para and tryb:
+                        sumy.append((tryb, para[0], para[1]))
+                    break
+
+            # ── Wynik netto (A.VI pasywów) – kolumna z "VI" + tekst "Zysk" ──
+            # Szukamy wiersza który zawiera zarówno "VI" jako osobną komórkę
+            # jak i słowo "Zysk" w innej komórce
+            if tryb == "P":
+                ma_VI = False
+                ma_zysk = False
+                poz_VI = -1
+                for i, kom in enumerate(w):
+                    if kom is None:
+                        continue
+                    tekst = str(kom).strip()
+                    if tekst == "VI":
+                        ma_VI = True
+                        poz_VI = i
+                    elif "zysk" in tekst.lower() and "netto" in tekst.lower():
+                        ma_zysk = True
+                if ma_VI and ma_zysk and poz_VI >= 0:
+                    liczby = wyciagnij_liczby(w[poz_VI + 1:])
+                    para = bierz_biezacy_ubiegly(liczby)
+                    if para:
+                        wynik.wynik_netto_biezacy = para[0]
+                        wynik.wynik_netto_ubiegly = para[1]
+
+            # ── Pozycja główna A/B/C/D ────────────────────────────────────────
+            if tryb:
+                for i, kom in enumerate(w):
+                    if kom is None:
+                        continue
+                    tekst = str(kom).strip()
+                    if len(tekst) == 1 and tekst in "ABCD":
+                        liczby = wyciagnij_liczby(w[i + 1:])
+                        para = bierz_biezacy_ubiegly(liczby)
+                        if para:
+                            target = znalezione_aktywa if tryb == "A" else znalezione_pasywa
+                            # "first wins" – pierwsza pozycja główna A/B/C/D
+                            # (kolejne np. "A.I" to podpozycje których nie
+                            # chcemy nadpisywać)
+                            if tekst not in target:
+                                target[tekst] = para
+                        break  # jedna pozycja na wiersz
+
+        # ── Przepisanie do DaneBilansu ───────────────────────────────────────
+        if "A" in znalezione_aktywa:
+            wynik.aktywa_trwale_biezacy, wynik.aktywa_trwale_ubiegly = znalezione_aktywa["A"]
+        if "B" in znalezione_aktywa:
+            wynik.aktywa_obrotowe_biezacy, wynik.aktywa_obrotowe_ubiegly = znalezione_aktywa["B"]
+        if "C" in znalezione_aktywa:
+            wynik.nalezne_wplaty_biezacy, wynik.nalezne_wplaty_ubiegly = znalezione_aktywa["C"]
+        if "D" in znalezione_aktywa:
+            wynik.udzialy_wlasne_biezacy, wynik.udzialy_wlasne_ubiegly = znalezione_aktywa["D"]
+
+        if "A" in znalezione_pasywa:
+            wynik.kapital_wlasny_biezacy, wynik.kapital_wlasny_ubiegly = znalezione_pasywa["A"]
+        if "B" in znalezione_pasywa:
+            wynik.zobowiazania_biezacy, wynik.zobowiazania_ubiegly = znalezione_pasywa["B"]
+
+        # Sumy – pierwsza z trybu A (aktywa), druga z P (pasywa)
+        for tr, b, u in sumy:
+            if tr == "A" and wynik.suma_aktywow_biezacy == Decimal("0"):
+                wynik.suma_aktywow_biezacy = b
+                wynik.suma_aktywow_ubiegly = u
+            elif tr == "P" and wynik.suma_pasywow_biezacy == Decimal("0"):
+                wynik.suma_pasywow_biezacy = b
+                wynik.suma_pasywow_ubiegly = u
+
+        logger.info(
+            f"Bilans (XLSX): Aktywa={wynik.suma_aktywow_biezacy:,.2f}, "
+            f"Pasywa={wynik.suma_pasywow_biezacy:,.2f}, "
+            f"Wynik netto={wynik.wynik_netto_biezacy:,.2f}"
+        )
+        return wynik
 
     def parsuj_pdf(self, dane_binarne: bytes) -> DaneBilansu:
         """PDF – ekstrahuje tekst i parsuje linia po linii."""
