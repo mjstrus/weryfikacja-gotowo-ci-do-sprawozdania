@@ -2196,11 +2196,20 @@ class SymfoniaYearEndAuditor:
         Automatyczne wykrywanie stanu klienta (przed/po zamknięciu roku) i
         stosowanie odpowiedniej reguły weryfikacji wyniku finansowego na 860:
 
-          Stan "Przed zamknięciem": saldo 860 ≠ 0 → musi = L z RZiS
-          Stan "Po zamknięciu":     saldo 860 = 0, obroty Ma − Wn = L z RZiS
+          Stan "Po zamknięciu bieżącego roku":
+              saldo 860 = 0, obroty 860 Ma − Wn = L z RZiS bieżący
 
-        Dodatkowe ostrzeżenie: jeśli 860 ma zero obrotów narastająco a grupy
-        4 i 7 mają salda – klient nie wykonał przeksięgowań zamykających.
+          Stan "Przed zamknięciem bieżącego roku":
+              saldo 860 ≠ 0 → musi = L z RZiS bieżący
+              LUB saldo 860 = 0 i obroty = 0 (konto w planie kont, ale
+              niewykorzystane) – wynik finansowy nadal jest na grupach 4/7
+              LUB saldo 860 = 0 i obroty = L z RZiS ZESZŁY (klient w tym
+              roku przeksięgował tylko zeszłoroczny wynik z 860 na 820/863,
+              a obecny rok jeszcze nie został zamknięty)
+
+        Dodatkowe ostrzeżenie gdy grupy 4/7 mają salda a 860 nie zawiera
+        bieżącego wyniku – oznacza że przeksięgowania zamykające jeszcze
+        nie zostały wykonane.
         """
         saldo_860 = dane_zois.konta.get("860")
         obroty_860 = dane_zois.obroty_narastajaco.get("860")
@@ -2216,26 +2225,114 @@ class SymfoniaYearEndAuditor:
         saldo_wn, saldo_ma = saldo_860 or (Decimal("0"), Decimal("0"))
         obr_wn, obr_ma = obroty_860 or (Decimal("0"), Decimal("0"))
         saldo_netto = saldo_ma - saldo_wn  # dodatni = Ma (zysk)
+        obroty_netto = obr_ma - obr_wn     # dodatni = Ma (zysk)
 
         TOL = Decimal("1.00")
+
+        # Pobierz wyniki z RZiS (bieżący i ubiegły) jeśli dostępne
+        zysk_rzis_biezacy = dane_rzis.zysk_netto[0] if dane_rzis else None
+        zysk_rzis_ubiegly = dane_rzis.zysk_netto[1] if dane_rzis else None
 
         # ── Detekcja stanu klienta ─────────────────────────────────────────
         ma_obroty = (obr_wn > Decimal("0") or obr_ma > Decimal("0"))
         ma_saldo  = (saldo_wn > Decimal("0") or saldo_ma > Decimal("0"))
 
-        if ma_obroty and not ma_saldo:
-            stan = "po_zamknieciu"
-            stan_opis = "po zamknięciu roku (wynik przeksięgowany na 821/863)"
-            wynik_z_860 = obr_ma - obr_wn
-        elif ma_saldo:
+        stan: str
+        stan_opis: str
+        wynik_z_860: Optional[Decimal] = None  # None = nie porównuj z RZiS
+
+        if ma_saldo and not ma_obroty:
+            # Saldo bez obrotów – wynik bieżącego roku leży na saldzie
             stan = "przed_zamknieciem"
             stan_opis = "przed zamknięciem roku (wynik na saldzie 860)"
             wynik_z_860 = saldo_netto
+
+        elif ma_saldo and ma_obroty:
+            # Saldo + obroty – zaczęto zamykać ale nie dokończono
+            # (np. przeksięgowania z grup 4/7 na 860 zrobione, ale 860
+            # nie przeksięgowane jeszcze na 820/863)
+            stan = "przed_zamknieciem"
+            stan_opis = ("przed zamknięciem roku (wynik na saldzie 860 – "
+                         "przeksięgowania z grup 4/7 wykonane, ale 860 "
+                         "nie przeksięgowane na 820/863)")
+            wynik_z_860 = saldo_netto
+
+        elif ma_obroty and not ma_saldo:
+            # Obroty bez salda – konto zostało użyte i przeksięgowane.
+            # Kluczowe pytanie: czy obroty dotyczą bieżącego roku czy zeszłego?
+            #
+            # Uwaga – dwa możliwe wzorce obrotów:
+            #   (a) obroty_netto = Ma - Wn = L (konto 860 dostało wynik grupy
+            #       4/7, potem został przeksięgowany na 820/863). Wtedy jedna
+            #       strona jest większa niż druga o L.
+            #   (b) obr_ma = obr_wn = L (przeksięgowanie "przez 860" – np.
+            #       Wn 860 / Ma 820 na kwotę zeszłorocznego zysku, zero salda,
+            #       ale obie strony = L).
+            # Dlatego porównujemy zarówno obroty_netto jak i obr_ma, obr_wn
+            # z RZiS bieżący i ubiegły.
+            def _pasuje(kwota_ref: Decimal) -> bool:
+                if kwota_ref == Decimal("0"):
+                    return False
+                return (
+                    abs(obroty_netto - kwota_ref) <= TOL
+                    or abs(obr_ma - kwota_ref) <= TOL
+                    or abs(obr_wn - kwota_ref) <= TOL
+                )
+
+            if zysk_rzis_biezacy is not None and zysk_rzis_ubiegly is not None:
+                pasuje_biezacy = _pasuje(zysk_rzis_biezacy)
+                pasuje_ubiegly = _pasuje(zysk_rzis_ubiegly)
+
+                if pasuje_biezacy and not pasuje_ubiegly:
+                    stan = "po_zamknieciu"
+                    stan_opis = ("po zamknięciu bieżącego roku "
+                                 "(wynik przeksięgowany z 860 na 820/863)")
+                    wynik_z_860 = obroty_netto if obroty_netto != Decimal("0") else obr_ma
+                elif pasuje_ubiegly and not pasuje_biezacy:
+                    # Obroty = wynik zeszłego roku – to znaczy że w bieżącym
+                    # roku wykonano TYLKO przeksięgowanie zeszłorocznego
+                    # wyniku z 860 na 820/863. Bieżący rok jeszcze nie został
+                    # zamknięty – wynik bieżący jest nadal na grupach 4/7.
+                    stan = "przed_zamknieciem_obecny_po_zeszlym"
+                    stan_opis = ("przed zamknięciem bieżącego roku – "
+                                 "klient w tym roku przeksięgował TYLKO "
+                                 "zeszłoroczny wynik z 860 na 820/863 "
+                                 "(obroty 860 ≈ L RZiS roku ubiegłego). "
+                                 "Bieżący wynik jest nadal na grupach 4/7 "
+                                 "– nie zostały jeszcze wykonane "
+                                 "przeksięgowania zamykające rok bieżący")
+                    wynik_z_860 = None  # Nie porównuj – obroty dotyczą zeszłego roku
+                elif pasuje_biezacy and pasuje_ubiegly:
+                    # Bieżący i zeszły przypadkowo równe – niejednoznaczne
+                    stan = "niejednoznaczny"
+                    stan_opis = ("niejednoznaczny – wynik bieżący = ubiegły "
+                                 f"({zysk_rzis_biezacy:,.2f} zł) – "
+                                 "nie można ustalić czego dotyczą obroty")
+                    wynik_z_860 = obroty_netto
+                else:
+                    # Obroty nie pasują ani do bieżącego ani do zeszłego
+                    stan = "niejednoznaczny"
+                    stan_opis = (f"niejednoznaczny – obroty 860 "
+                                 f"(Wn={obr_wn:,.2f}, Ma={obr_ma:,.2f}, "
+                                 f"netto={obroty_netto:,.2f}) nie pasują "
+                                 f"ani do RZiS bież. ({zysk_rzis_biezacy:,.2f}) "
+                                 f"ani do RZiS ubiegły ({zysk_rzis_ubiegly:,.2f})")
+                    wynik_z_860 = obroty_netto
+            else:
+                # Brak RZiS – zakładamy że obroty = wynik bieżący (zachowanie starsze)
+                stan = "po_zamknieciu"
+                stan_opis = ("po zamknięciu roku (wynik przeksięgowany "
+                             "z 860 na 820/863) – bez RZiS nie można "
+                             "zweryfikować czy obroty dotyczą bieżącego roku")
+                wynik_z_860 = obroty_netto
+
         else:
-            # Brak obrotów i salda – klient nie zrobił przeksięgowań
+            # Brak obrotów i brak salda – konto w planie kont ale niewykorzystane
             stan = "brak_zamkniecia"
-            stan_opis = "brak przeksięgowań"
-            wynik_z_860 = Decimal("0")
+            stan_opis = ("przed zamknięciem roku – konto 860 istnieje "
+                         "w planie kont ale nie zostało jeszcze użyte "
+                         "(brak przeksięgowań z grup 4/7)")
+            wynik_z_860 = None
 
         self._wyniki.append(PunktKontroli(
             konto="860", punkt="Wykryty stan cyklu zamknięcia",
@@ -2243,8 +2340,8 @@ class SymfoniaYearEndAuditor:
             uwagi=f"Wykryto stan: {stan_opis}.",
         ))
 
-        # ── Porównanie z RZiS ──────────────────────────────────────────────
-        if dane_rzis is not None and stan != "brak_zamkniecia":
+        # ── Porównanie z RZiS (tylko gdy wynik_z_860 reprezentuje bieżący rok) ──
+        if dane_rzis is not None and wynik_z_860 is not None:
             zysk_rzis = dane_rzis.zysk_netto[0]
             roznica = abs(wynik_z_860 - zysk_rzis)
             if roznica <= TOL:
@@ -2263,8 +2360,17 @@ class SymfoniaYearEndAuditor:
                            f"RZiS L={zysk_rzis:,.2f} zł | Δ={roznica:,.2f} zł."),
                 ))
 
-        # ── Ostrzeżenie: brak przeksięgowań (grupa 4/7 ma salda, 860 puste) ──
-        if stan == "brak_zamkniecia":
+        # ── Informacja: przeksięgowania zamykające ───────────────────────────
+        # Gdy klient jest "przed zamknięciem" a grupy 4/7 mają salda – znaczy
+        # że przeksięgowania jeszcze nie zostały wykonane. W prawidłowo
+        # zamkniętym roku grupy 4 i 7 powinny być wyzerowane (saldo końcowe),
+        # a ich wartości powinny trafić na 860.
+        stany_przed_zamknieciem = {
+            "brak_zamkniecia",
+            "przed_zamknieciem",
+            "przed_zamknieciem_obecny_po_zeszlym",
+        }
+        if stan in stany_przed_zamknieciem:
             grupa_4 = sum(
                 (wn for k, (wn, _) in dane_zois.konta.items() if get_grupa(k) == 4),
                 Decimal("0"),
@@ -2274,14 +2380,29 @@ class SymfoniaYearEndAuditor:
                 Decimal("0"),
             )
             if grupa_4 > Decimal("0") or grupa_7_ma > Decimal("0"):
-                self._wyniki.append(PunktKontroli(
-                    konto="860", punkt="Przeksięgowania zamykające",
-                    status=StatusAudytu.OSTRZEZ,
-                    uwagi=(f"Grupa 4 (koszty)={grupa_4:,.2f} zł, "
-                           f"Grupa 7 (przychody)={grupa_7_ma:,.2f} zł, "
-                           f"ale konto 860 jest puste. "
-                           "Klient nie wykonał przeksięgowań zamykających rok."),
-                ))
+                # Jeśli saldo 860 ≠ 0 – częściowe przeksięgowania zrobione
+                if ma_saldo:
+                    self._wyniki.append(PunktKontroli(
+                        konto="860", punkt="Przeksięgowania zamykające",
+                        status=StatusAudytu.INFO,
+                        uwagi=(f"Grupa 4 (koszty)={grupa_4:,.2f} zł, "
+                               f"Grupa 7 (przychody)={grupa_7_ma:,.2f} zł. "
+                               f"Saldo 860={saldo_netto:,.2f} zł. "
+                               "Do wykonania ostatniego kroku: przeksięgowanie "
+                               "860 na 820 (zysk) lub 863 (strata z lat ubiegłych)."),
+                    ))
+                else:
+                    # 860 puste + grupy 4/7 mają salda = przeksięgowania nie wykonane
+                    self._wyniki.append(PunktKontroli(
+                        konto="860", punkt="Przeksięgowania zamykające",
+                        status=StatusAudytu.OSTRZEZ,
+                        uwagi=(f"Grupa 4 (koszty)={grupa_4:,.2f} zł, "
+                               f"Grupa 7 (przychody)={grupa_7_ma:,.2f} zł, "
+                               f"ale konto 860 jest puste. "
+                               "Klient nie wykonał przeksięgowań zamykających rok. "
+                               "Do wykonania: przeksięgowanie grup 4 i 7 na 860, "
+                               "a następnie 860 na 820/863."),
+                    ))
 
     # ─── R3: WERYFIKACJA KAPITAŁU vs KRS (v3.2) ──────────────────────────────
 
