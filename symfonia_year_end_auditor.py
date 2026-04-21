@@ -2266,6 +2266,72 @@ def pobierz_dane_krs(numer_krs: str, timeout_sec: int = 15) -> DaneKRS:
         return DaneKRS(numer_krs=krs_padded, blad=f"Błąd parsowania odpowiedzi KRS: {e}")
 
 
+# =============================================================================
+# WYSYŁKA RAPORTU EMAIL (v3.4)
+# =============================================================================
+
+def wyslij_raport_email(
+    *,
+    nadawca: str,
+    odbiorca: str,
+    haslo: str,
+    temat: str,
+    tresc_tekstowa: str,
+    serwer_smtp: str = "mail.abacus24.pl",
+    port: int = 465,
+) -> Tuple[bool, str]:
+    """
+    Wysyła raport audytu na podany adres e-mail przez SMTP SSL.
+
+    Args:
+        nadawca: adres skrzynki nadawczej (np. spraw_przyg@abacus24.pl)
+        odbiorca: adres odbiorcy
+        haslo: hasło do skrzynki nadawczej (zwykle ze st.secrets)
+        temat: temat wiadomości
+        tresc_tekstowa: treść jako plain text (raport + komentarze)
+        serwer_smtp: hostname serwera SMTP (default mail.abacus24.pl)
+        port: port SMTP (default 465 dla SSL)
+
+    Returns:
+        (sukces, komunikat): (True, "") przy sukcesie, (False, "...") przy błędzie
+    """
+    import smtplib
+    import ssl
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from email.utils import formatdate, make_msgid
+
+    if not nadawca or not odbiorca or not haslo:
+        return False, "Brak nadawcy, odbiorcy lub hasła."
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["From"] = nadawca
+        msg["To"] = odbiorca
+        msg["Subject"] = temat
+        msg["Date"] = formatdate(localtime=True)
+        msg["Message-ID"] = make_msgid(domain=nadawca.split("@")[-1])
+        msg.attach(MIMEText(tresc_tekstowa, "plain", "utf-8"))
+
+        kontekst = ssl.create_default_context()
+        with smtplib.SMTP_SSL(serwer_smtp, port, context=kontekst, timeout=30) as s:
+            s.login(nadawca, haslo)
+            s.sendmail(nadawca, [odbiorca], msg.as_string())
+
+        return True, "Wiadomość wysłana pomyślnie."
+
+    except smtplib.SMTPAuthenticationError:
+        return False, "Błąd autoryzacji SMTP – sprawdź hasło w Streamlit Secrets."
+    except smtplib.SMTPConnectError as e:
+        return False, f"Nie udało się połączyć z {serwer_smtp}:{port} – {e}"
+    except smtplib.SMTPException as e:
+        return False, f"Błąd SMTP: {e}"
+    except TimeoutError:
+        return False, f"Timeout połączenia z {serwer_smtp}:{port}."
+    except Exception as e:
+        return False, f"Nieoczekiwany błąd wysyłki: {e}"
+
+
 
 
 # =============================================================================
