@@ -786,15 +786,104 @@ class ParserRZiS:
     )
 
     def parsuj_xlsx(self, dane_binarne: bytes) -> DaneRZiS:
+        """
+        Parser XLSX dla RZiS (wariant porównawczy).
+
+        Symfonia eksportuje XLSX ze scalonymi komórkami gdzie litera pozycji
+        (A-L) jest w jednej komórce, a liczby w dalekich kolumnach, z pustymi
+        komórkami pomiędzy. Klasyczne " ".join() zamienia to na ciąg trudny
+        do sparsowania regexem.
+
+        Strategia: iterujemy po każdym wierszu i:
+          1. Znajdujemy komórkę zawierającą dokładnie pojedynczą literę A-L
+          2. Bierzemy wszystkie liczbowe wartości z kolejnych komórek
+          3. Pierwsze dwie liczby to: rok bieżący i rok ubiegły
+             (trzecia to odchylenie, czwarta różnica – ignorujemy)
+
+        Strategia "last wins" dla pozycji I (rzymska I w podsekcjach B, G, H
+        kolidowałaby z główną literą I – ostatnie wystąpienie wygrywa).
+        """
         bufor = io.BytesIO(dane_binarne)
         try:
             wb = openpyxl.load_workbook(bufor, data_only=True)
-            linie = []
-            for w in wb.active.iter_rows(values_only=True):
-                linie.append(" ".join(str(k) for k in w if k is not None))
         except Exception as e:
             raise ValueError(f"Błąd odczytu XLSX (RZiS): {e}")
-        return self._parsuj_linie(linie)
+
+        znalezione: Dict[str, Tuple[Decimal, Decimal]] = {}
+
+        for w in wb.active.iter_rows(values_only=True):
+            # Znajdź komórkę będącą dokładnie pojedynczą literą A-L
+            poz_litery = None
+            for i, kom in enumerate(w):
+                if kom is None:
+                    continue
+                tekst = str(kom).strip()
+                if len(tekst) == 1 and tekst in "ABCDEFGHIJKL":
+                    poz_litery = i
+                    break
+
+            if poz_litery is None:
+                # Alternatywnie – zwykły format PDF ("A  Tekst  kwota kwota")
+                # może być używany jeśli plik był konwertowany. Spróbujmy regexu.
+                linia = " ".join(str(k) for k in w if k is not None)
+                m = self.RE_POZ.match(linia)
+                if m:
+                    lit = m.group(1)
+                    try:
+                        b = normalize_currency(m.group(2))
+                        u = normalize_currency(m.group(3))
+                        znalezione[lit] = (b, u)
+                    except ValueError:
+                        pass
+                continue
+
+            litera = str(w[poz_litery]).strip()
+
+            # Od tej pozycji zbieraj wszystkie liczby
+            liczby: List[Decimal] = []
+            for kom in w[poz_litery + 1:]:
+                if kom is None or kom == "":
+                    continue
+                # Liczba jako float/int lub jako string z polskim formatem
+                if isinstance(kom, (int, float)):
+                    try:
+                        liczby.append(Decimal(str(round(float(kom), 2))))
+                    except (ValueError, InvalidOperation):
+                        pass
+                else:
+                    tekst_kom = str(kom).strip()
+                    # Pomijamy teksty które nie wyglądają jak liczba
+                    if re.match(r"^-?[\d\s.,]+$", tekst_kom):
+                        try:
+                            liczby.append(normalize_currency(tekst_kom))
+                        except ValueError:
+                            pass
+
+            if len(liczby) >= 2:
+                # Układ kolumn w XLSX Symfonii:
+                #   [0] rok bieżący
+                #   [1] odchylenie (zawsze 0)
+                #   [2] rok ubiegły
+                #   [3] odchylenie (zawsze 0)
+                #   [4] różnica
+                # Jeśli mamy >= 3 liczby – bierzemy [0] i [2] (omijając odchylenie)
+                # Fallback – gdy kolumn jest tylko 2 (format skrócony) bierzemy [0] i [1]
+                if len(liczby) >= 3:
+                    znalezione[litera] = (liczby[0], liczby[2])
+                else:
+                    znalezione[litera] = (liczby[0], liczby[1])
+
+        wynik = DaneRZiS()
+        for lit, pole in DaneRZiS.MAPA_POZYCJI.items():
+            if lit in znalezione:
+                setattr(wynik, pole, znalezione[lit])
+
+        logger.info(
+            f"RZiS (XLSX): Przychody(A)={wynik.przychody_sprzedazy[0]:,.2f}, "
+            f"Koszty(B)={wynik.koszty_operacyjne[0]:,.2f}, "
+            f"Zysk netto(L)={wynik.zysk_netto[0]:,.2f}"
+        )
+        return wynik
 
     def parsuj_pdf(self, dane_binarne: bytes) -> DaneRZiS:
         if not PDF_AVAILABLE:
