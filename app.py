@@ -25,6 +25,7 @@ from symfonia_year_end_auditor import (
     MIESIACE_PL,
     normalize_currency,
     pobierz_dane_krs,
+    parsuj_dra,
     wyslij_raport_email,
 )
 
@@ -209,7 +210,7 @@ st.markdown("""
 
 def reset_state():
     """Reset wszystkich danych audytu."""
-    for k in ["dane_zois", "dane_bilans", "dane_rzis", "dane_krs", "konta_bankowe",
+    for k in ["dane_zois", "dane_bilans", "dane_rzis", "dane_krs", "dane_dra", "konta_bankowe",
               "wyciagi", "raport", "etap"]:
         if k in st.session_state:
             del st.session_state[k]
@@ -385,6 +386,16 @@ if st.session_state["etap"] == 1:
             key="input_krs",
         )
 
+        # ── DRA (opcjonalna – do weryfikacji zobowiązania ZUS) ───────────────
+        plik_dra = st.file_uploader(
+            "📑 Deklaracja DRA za grudzień (opcjonalnie)",
+            type=["pdf"],
+            key="upload_dra",
+            help=("Plik PDF z programu Płatnik – deklaracja rozliczeniowa ZUS. "
+                  "Używana do porównania kwoty zobowiązania z saldem konta ZUS "
+                  "w ZOiS. Przydatne gdy konto ZUS w ZOiS ma saldo Ma > 0."),
+        )
+
         tryb_testowy = st.checkbox(
             "🧪 Tryb diagnostyczny",
             help=("Uruchamia audyt na minimalnych danych syntetycznych. "
@@ -429,6 +440,7 @@ if st.session_state["etap"] == 1:
                     st.session_state["dane_bilans"] = None
                     st.session_state["dane_rzis"] = None
                     st.session_state["dane_krs"] = None
+                    st.session_state["dane_dra"] = None
                     st.session_state["nazwa_podmiotu"] = "[TRYB DIAGNOSTYCZNY]"
                     st.session_state["tryb_testowy"] = True
                 else:
@@ -465,6 +477,24 @@ if st.session_state["etap"] == 1:
                                 )
                     else:
                         st.session_state["dane_krs"] = None
+
+                    # DRA (opcjonalnie – parsowanie PDF deklaracji ZUS)
+                    if plik_dra is not None:
+                        with st.spinner("Parsuję deklarację DRA…"):
+                            dra = parsuj_dra(plik_dra.read())
+                            st.session_state["dane_dra"] = dra
+                            if dra.blad:
+                                st.warning(f"⚠️ DRA: {dra.blad}")
+                            else:
+                                okres = (f"{dra.miesiac:02d}/{dra.rok}"
+                                         if dra.miesiac and dra.rok else "?")
+                                st.success(
+                                    f"✅ DRA sparsowana: {dra.nazwa} "
+                                    f"za {okres} | "
+                                    f"do zapłaty: {dra.kwota_do_zaplaty:,.2f} zł"
+                                )
+                    else:
+                        st.session_state["dane_dra"] = None
 
                 # Wykrycie rachunków
                 st.session_state["konta_bankowe"] = dz.pobierz_konta_bankowe()
@@ -684,6 +714,7 @@ elif st.session_state["etap"] == 2:
                     dane_bilans=st.session_state.get("dane_bilans"),
                     dane_rzis=st.session_state.get("dane_rzis"),
                     dane_krs=st.session_state.get("dane_krs"),
+                    dane_dra=st.session_state.get("dane_dra"),
                     wyciagi=list(wyciagi_dict.values()),
                     rok_obrachunkowy=st.session_state["rok"],
                 )
