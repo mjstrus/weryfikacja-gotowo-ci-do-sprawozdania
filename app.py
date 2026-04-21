@@ -533,24 +533,27 @@ elif st.session_state["etap"] == 2:
                         type=["pdf", "xlsx", "xls"],
                         key=f"w_{numer_ks}",
                         label_visibility="collapsed",
+                        help="Po wgraniu plik zostanie automatycznie sparsowany.",
                     )
-                    if plik_w:
-                        if st.button(
-                            f"📄 Parsuj wyciąg dla {numer_ks}",
-                            key=f"btn_p_{numer_ks}",
-                            use_container_width=True,
-                        ):
-                            try:
-                                w = audytor.parsuj_wyciag(
-                                    numer_konta_ksiegowego=numer_ks,
-                                    dane_binarne=plik_w.read(),
-                                    format_pliku=pobierz_format(plik_w),
-                                )
-                                wyciagi_dict[numer_ks] = w
-                                st.session_state["wyciagi"] = wyciagi_dict
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Błąd parsowania: {e}")
+                    # Auto-parsowanie: jeśli plik jest wgrany i jeszcze nie
+                    # zapisaliśmy dla tego rachunku ani nie mamy flagi że był
+                    # już sparsowany ten konkretny plik – parsujemy teraz.
+                    plik_id_key = f"_parsed_file_{numer_ks}"
+                    plik_file_id = plik_w.file_id if plik_w else None
+
+                    if plik_w and st.session_state.get(plik_id_key) != plik_file_id:
+                        try:
+                            w = audytor.parsuj_wyciag(
+                                numer_konta_ksiegowego=numer_ks,
+                                dane_binarne=plik_w.read(),
+                                format_pliku=pobierz_format(plik_w),
+                            )
+                            wyciagi_dict[numer_ks] = w
+                            st.session_state["wyciagi"] = wyciagi_dict
+                            st.session_state[plik_id_key] = plik_file_id
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Błąd parsowania: {e}")
 
                 # ── Wariant B: ręczne saldo ──────────────────────────────────
                 with col_r:
