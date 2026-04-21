@@ -251,6 +251,18 @@ with st.sidebar:
     st.session_state["rok"] = rok
 
     st.markdown("---")
+    st.markdown("### 👤 Osoba księgująca")
+    osoba_ksiegujaca = st.text_input(
+        "Imię i nazwisko",
+        value=st.session_state.get("osoba_ksiegujaca", ""),
+        placeholder="np. Jan Kowalski",
+        key="input_osoba_ksiegujaca",
+        help=("Imię i nazwisko osoby przeprowadzającej audyt. "
+              "Pojawi się w raporcie i w mailu do Głównej Księgowej."),
+    )
+    st.session_state["osoba_ksiegujaca"] = osoba_ksiegujaca
+
+    st.markdown("---")
     st.markdown("### ⚙️ Akcje")
 
     if st.button("🔄 Rozpocznij od nowa", use_container_width=True):
@@ -865,11 +877,21 @@ elif st.session_state["etap"] == 3:
             if ("BŁĄD" in w["status"]) or ("OSTRZEŻENIE" in w["status"])
         ]
 
+        # Walidacja: osoba księgująca musi być wpisana przed wysyłką
+        osoba = (st.session_state.get("osoba_ksiegujaca") or "").strip()
+        brak_osoby = not osoba
+
+        if brak_osoby:
+            st.warning(
+                "⚠️ Przed przekazaniem raportu podaj w sidebarze (sekcja "
+                "**Osoba księgująca**) imię i nazwisko osoby przeprowadzającej audyt."
+            )
+
         if not wymagajace:
             st.success(
                 "🎉 Brak błędów i ostrzeżeń – raport można przekazać bez komentarzy."
             )
-            przekazywalny = True
+            przekazywalny = not brak_osoby
             brakujace_komentarze = []
         else:
             # Sprawdzamy czy wszystkie komentarze są wypełnione
@@ -901,6 +923,8 @@ elif st.session_state["etap"] == 3:
                 with st.expander(f"Lista pozycji bez komentarza ({len(brakujace_komentarze)})"):
                     for konto, punkt in brakujace_komentarze:
                         st.markdown(f"- **{konto}** · {punkt}")
+                przekazywalny = False
+            elif brak_osoby:
                 przekazywalny = False
             else:
                 st.success(
@@ -936,6 +960,7 @@ elif st.session_state["etap"] == 3:
                     f"Raport kontroli jakości danych przed zamknięciem roku",
                     f"Podmiot: {podmiot}",
                     f"Rok obrachunkowy: {rok_disp}",
+                    f"Osoba księgująca: {osoba}",
                     "",
                     "=" * 70,
                     "PODSUMOWANIE",
@@ -950,7 +975,7 @@ elif st.session_state["etap"] == 3:
                 if wymagajace:
                     linie.extend([
                         "=" * 70,
-                        "KOMENTARZE OSOBY KSIĘGUJĄCEJ",
+                        f"KOMENTARZE OSOBY KSIĘGUJĄCEJ ({osoba})",
                         "=" * 70,
                         "",
                     ])
@@ -966,7 +991,7 @@ elif st.session_state["etap"] == 3:
                             f"Punkt: {w['punkt']}",
                             f"Status: {w['status']}",
                             f"Uwagi systemu: {w['uwagi']}",
-                            f"Komentarz księgowej: {komentarz_tekst}",
+                            f"Komentarz ({osoba}): {komentarz_tekst}",
                             "-" * 70,
                             "",
                         ])
@@ -980,7 +1005,7 @@ elif st.session_state["etap"] == 3:
                 ])
 
                 tresc = "\n".join(linie)
-                temat = f"Raport zamknięcia roku {rok_disp} – {podmiot}"
+                temat = f"Raport zamknięcia roku {rok_disp} – {podmiot} – {osoba}"
 
                 with st.spinner("Wysyłanie…"):
                     sukces, komunikat = wyslij_raport_email(
