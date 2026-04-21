@@ -25,6 +25,7 @@ from symfonia_year_end_auditor import (
     MIESIACE_PL,
     normalize_currency,
     pobierz_dane_krs,
+    wyslij_raport_email,
 )
 
 # =============================================================================
@@ -293,7 +294,7 @@ def pobierz_format(plik) -> str:
     return "pdf" if plik.name.lower().endswith(".pdf") else "xlsx"
 
 
-def renderuj_wynik(wynik: dict):
+def renderuj_wynik(wynik: dict, indeks: int = 0):
     mapa = {
         "✅ OK":            ("ok",      "✅"),
         "❌ BŁĄD":          ("blad",    "❌"),
@@ -316,6 +317,22 @@ def renderuj_wynik(wynik: dict):
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # Pole komentarza dla błędów i ostrzeżeń (wymagane do wysyłki maila)
+    status = wynik["status"]
+    wymaga_komentarza = ("BŁĄD" in status) or ("OSTRZEŻENIE" in status)
+    if wymaga_komentarza:
+        klucz = f"komentarz_{indeks}_{wynik['konto']}_{wynik['punkt'][:40]}"
+        komentarze = st.session_state.setdefault("komentarze", {})
+        komentarz = st.text_area(
+            "💬 Komentarz osoby księgującej (wymagany)",
+            value=komentarze.get(klucz, ""),
+            key=klucz,
+            height=70,
+            placeholder="Opisz podjęte działania lub wyjaśnienie rozbieżności…",
+            label_visibility="visible",
+        )
+        komentarze[klucz] = komentarz
 
 
 # =============================================================================
@@ -753,8 +770,8 @@ elif st.session_state["etap"] == 3:
         if not do_pokazania:
             st.success("Brak wyników dla wybranych filtrów.")
         else:
-            for w in do_pokazania:
-                renderuj_wynik(w)
+            for idx, w in enumerate(do_pokazania):
+                renderuj_wynik(w, indeks=idx)
 
     with col_r:
         st.markdown('<div class="section-title">Eksport</div>', unsafe_allow_html=True)
@@ -803,6 +820,153 @@ elif st.session_state["etap"] == 3:
 
         with st.expander("📄 Raport tekstowy"):
             st.text(raport["tekst"])
+
+        # ═══ WYSYŁKA DO GŁÓWNEJ KSIĘGOWEJ ════════════════════════════════════
+        st.markdown("---")
+        st.markdown(
+            '<div class="section-title">📧 Przekazanie do Głównej Księgowej</div>',
+            unsafe_allow_html=True
+        )
+
+        # Zbieramy wszystkie błędy i ostrzeżenia wymagające komentarza
+        wymagajace = [
+            w for w in wyniki
+            if ("BŁĄD" in w["status"]) or ("OSTRZEŻENIE" in w["status"])
+        ]
+
+        if not wymagajace:
+            st.success(
+                "🎉 Brak błędów i ostrzeżeń – raport można przekazać bez komentarzy."
+            )
+            przekazywalny = True
+            brakujace_komentarze = []
+        else:
+            # Sprawdzamy czy wszystkie komentarze są wypełnione
+            # (komentarze trafiają do session_state["komentarze"] w renderuj_wynik,
+            # ale user może nie wyświetlił wszystkich pozycji – sprawdzamy
+            # wszystkie wymagające, nawet te przefiltrowane)
+            komentarze = st.session_state.get("komentarze", {})
+            brakujace_komentarze = []
+            for idx, w in enumerate(wymagajace):
+                # Klucz nie zawsze będzie w state jeśli użytkownik przefiltrował
+                # i nie widział danego wyniku – sprawdzamy czy istnieje NIEPUSTY
+                # komentarz którego klucz kończy się na ten sam konto+punkt
+                wzor = f"_{w['konto']}_{w['punkt'][:40]}"
+                znaleziono = any(
+                    k.endswith(wzor) and (v or "").strip()
+                    for k, v in komentarze.items()
+                )
+                if not znaleziono:
+                    brakujace_komentarze.append((w["konto"], w["punkt"]))
+
+            if brakujace_komentarze:
+                st.warning(
+                    f"⚠️ Uzupełnij komentarze ({len(brakujace_komentarze)} "
+                    f"z {len(wymagajace)}) dla wszystkich błędów i ostrzeżeń. "
+                    "Brakujące pozycje są widoczne w filtrach statusu – "
+                    "zaznacz oba filtry BŁĄD i OSTRZEŻENIE aby zobaczyć "
+                    "wszystkie pola komentarza."
+                )
+                with st.expander(f"Lista pozycji bez komentarza ({len(brakujace_komentarze)})"):
+                    for konto, punkt in brakujace_komentarze:
+                        st.markdown(f"- **{konto}** · {punkt}")
+                przekazywalny = False
+            else:
+                st.success(
+                    f"✅ Wszystkie komentarze uzupełnione "
+                    f"({len(wymagajace)}/{len(wymagajace)}). "
+                    "Raport jest gotowy do przekazania."
+                )
+                przekazywalny = True
+
+        # Przycisk wysyłki
+        adres_odbiorcy = "spraw_przyg@abacus24.pl"
+        if st.button(
+            f"📧 Wyślij do Głównej Księgowej ({adres_odbiorcy})",
+            type="primary",
+            use_container_width=True,
+            disabled=not przekazywalny,
+        ):
+            try:
+                haslo_smtp = st.secrets.get("SMTP_PASSWORD", "")
+            except Exception:
+                haslo_smtp = ""
+
+            if not haslo_smtp:
+                st.error(
+                    "❌ Brak konfiguracji SMTP. Administrator musi dodać sekret "
+                    "`SMTP_PASSWORD` w ustawieniach Streamlit Cloud "
+                    "(Manage app → Settings → Secrets)."
+                )
+            else:
+                # Zbuduj treść maila: raport + sekcja komentarzy
+                komentarze = st.session_state.get("komentarze", {})
+                linie = [
+                    f"Raport kontroli jakości danych przed zamknięciem roku",
+                    f"Podmiot: {podmiot}",
+                    f"Rok obrachunkowy: {rok_disp}",
+                    "",
+                    "=" * 70,
+                    "PODSUMOWANIE",
+                    "=" * 70,
+                    f"✅ Poprawne: {podsum['ok']}",
+                    f"❌ Błędy krytyczne: {podsum['bledy']}",
+                    f"⚠️  Ostrzeżenia: {podsum['ostrzezenia']}",
+                    f"🔍 Brak danych: {podsum['brak_danych']}",
+                    "",
+                ]
+
+                if wymagajace:
+                    linie.extend([
+                        "=" * 70,
+                        "KOMENTARZE OSOBY KSIĘGUJĄCEJ",
+                        "=" * 70,
+                        "",
+                    ])
+                    for w in wymagajace:
+                        wzor = f"_{w['konto']}_{w['punkt'][:40]}"
+                        komentarz_tekst = next(
+                            (v for k, v in komentarze.items()
+                             if k.endswith(wzor) and (v or "").strip()),
+                            "(brak)"
+                        )
+                        linie.extend([
+                            f"Konto: {w['konto']}",
+                            f"Punkt: {w['punkt']}",
+                            f"Status: {w['status']}",
+                            f"Uwagi systemu: {w['uwagi']}",
+                            f"Komentarz księgowej: {komentarz_tekst}",
+                            "-" * 70,
+                            "",
+                        ])
+
+                linie.extend([
+                    "=" * 70,
+                    "PEŁNY RAPORT AUDYTU",
+                    "=" * 70,
+                    "",
+                    raport["tekst"],
+                ])
+
+                tresc = "\n".join(linie)
+                temat = f"Raport zamknięcia roku {rok_disp} – {podmiot}"
+
+                with st.spinner("Wysyłanie…"):
+                    sukces, komunikat = wyslij_raport_email(
+                        nadawca=adres_odbiorcy,
+                        odbiorca=adres_odbiorcy,
+                        haslo=haslo_smtp,
+                        temat=temat,
+                        tresc_tekstowa=tresc,
+                        serwer_smtp="mail.abacus24.pl",
+                        port=465,
+                    )
+
+                if sukces:
+                    st.success(f"✅ {komunikat} Raport trafił do Głównej Księgowej.")
+                    st.balloons()
+                else:
+                    st.error(f"❌ Nie udało się wysłać: {komunikat}")
 
         st.markdown("---")
         if st.button("↻ Wróć do wyciągów", use_container_width=True):
