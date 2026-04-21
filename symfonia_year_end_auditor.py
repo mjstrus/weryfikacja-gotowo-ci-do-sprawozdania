@@ -3,6 +3,9 @@
 SymfoniaYearEndAuditor – Automatyczna Kontrola Jakości Danych Finansowych
 Biuro Rachunkowe Abacus | Zamknięcie Roku Obrachunkowego
 =============================================================================
+Wersja 3.3 – uniwersalny parser wyciągów: obsługa zestawień operacji (mBank)
+             obok klasycznych wyciągów. Obsługa tekstu bez spacji w PDF.
+
 Wersja 3.2 – trzy krytyczne kontrole zamknięcia roku:
 
   R1: Weryfikacja konta 860 (Wynik finansowy) z auto-detekcją stanu
@@ -833,15 +836,35 @@ class ParserRZiS:
 
 
 # =============================================================================
-# PARSER WYCIĄGU BANKOWEGO (bez zmian)
+# PARSER WYCIĄGU BANKOWEGO / ZESTAWIENIA OPERACJI (v3.3)
+# =============================================================================
+# Obsługuje oba typy dokumentów:
+#   - Standardowy wyciąg bankowy (np. Santander)
+#   - Elektroniczne zestawienie operacji (np. mBank)
+# Radzi sobie z tekstem bez spacji (pdfplumber przy niektórych fontach zwraca
+# "Saldokońcowe:20992,02" zamiast "Saldo końcowe: 20 992,02").
 # =============================================================================
 
 class ParserWyciaguBankowego:
+    # Wzorce dla salda końcowego. Niektóre banki (np. mBank) eksportują PDF
+    # w którym pdfplumber zwraca tekst bez spacji ("Saldokońcowe:20992,02"),
+    # dlatego szukamy zarówno z jak i bez spacji.
     KLUCZE_SALDO = [
-        "saldo końcowe", "saldo na koniec", "closing balance",
-        "stan na koniec", "saldo końca okresu",
+        "saldo końcowe", "saldokońcowe",
+        "saldo na koniec", "saldonakoniec",
+        "closing balance", "closingbalance",
+        "stan na koniec", "stannakoniec",
+        "saldo końca okresu", "saldokońcaokresu",
+        "saldo po operacji",  # ostatni wiersz tabeli transakcji
     ]
     WZORZEC_IBAN = re.compile(r"(?:PL)?\s*(\d{2}\s*(?:\d{4}\s*){6})")
+    # Regex dla kwoty – również tolerancyjny na brak spacji
+    RE_SALDO_KWOTA = re.compile(r"(-?\d{1,3}(?:[\s.]\d{3})*,\d{2}|-?\d+,\d{2})")
+    # Regex dla okresu zestawienia: "za okres od 2025-12-01 do 2025-12-31"
+    RE_OKRES = re.compile(
+        r"(?:okres|zaokres)[^\d]*?(\d{4})-(\d{1,2})-(\d{1,2})[^\d]+?(\d{4})-(\d{1,2})-(\d{1,2})",
+        re.IGNORECASE,
+    )
     ZNANE_BANKI = [
         "Santander", "PKO BP", "PKO Bank", "mBank", "ING Bank", "Pekao",
         "BNP Paribas", "Millennium", "Credit Agricole", "Alior", "Citi",
@@ -862,14 +885,23 @@ class ParserWyciaguBankowego:
         with pdfplumber.open(bufor) as pdf:
             for strona in pdf.pages:
                 caly_tekst += dekoduj_cid(strona.extract_text() or "") + "\n"
+            # Szukamy salda od końca (ostatnia strona = saldo końcowe)
             for strona in reversed(pdf.pages):
                 t = dekoduj_cid(strona.extract_text() or "")
                 s = self._wyciagnij_saldo(t)
                 if s and s != Decimal("0"):
                     saldo = s
                     break
-        data_op = wykryj_date_ostatniej_operacji(caly_tekst)
-        rok, mies = data_op if data_op else (None, None)
+
+        # Preferuj datę z nagłówka "za okres od X do Y" – pewniejsza niż
+        # szukanie najpóźniejszej daty w całym tekście (mBank ma np. datę
+        # "następnej kapitalizacji 2026-01-31" w nagłówku, która nie powinna
+        # być traktowana jako data ostatniej operacji).
+        rok, mies = self._wykryj_okres_zestawienia(caly_tekst)
+        if rok is None:
+            data_op = wykryj_date_ostatniej_operacji(caly_tekst)
+            rok, mies = data_op if data_op else (None, None)
+
         return saldo, rok, mies, self._iban(caly_tekst), self._bank(caly_tekst)
 
     def _parsuj_xlsx(self, dane_binarne: bytes):
@@ -899,18 +931,72 @@ class ParserWyciaguBankowego:
         rok, mies = data_op if data_op else (None, None)
         return saldo, rok, mies, self._iban(caly_tekst), self._bank(caly_tekst)
 
-    def _wyciagnij_saldo(self, tekst: str):
-        for linia in tekst.splitlines():
+    def _wyciagnij_saldo(self, tekst: str) -> Optional[Decimal]:
+        """
+        Szuka salda końcowego w tekście wyciągu.
+
+        Radzi sobie z dwoma formatami:
+          - Ze spacjami: "Saldo końcowe: 20.992,02"
+          - Bez spacji (mBank, pdfplumber bez spacji): "Saldokońcowe:20992,02"
+
+        Priorytet: ostatnie wystąpienie słowa kluczowego w tekście (tak jak
+        na wyciągu – saldo końcowe jest na dole ostatniej strony).
+        """
+        # Znormalizuj: lowercase + usuń spacje dla porównania
+        tekst_no_space = re.sub(r"\s+", "", tekst).lower()
+        tekst_lower = tekst.lower()
+
+        # Spróbuj najpierw metodą "linia po linii" (klasyczny format)
+        for linia in reversed(tekst.splitlines()):
             ll = linia.lower()
-            if any(k in ll for k in self.KLUCZE_SALDO):
-                for token in reversed(linia.split()):
+            if any(k in ll for k in self.KLUCZE_SALDO if " " in k):
+                # Standardowy format ze spacjami – szukaj kwot w linii
+                kwoty = self.RE_SALDO_KWOTA.findall(linia)
+                for kwota_str in reversed(kwoty):
                     try:
-                        kw = normalize_currency(token)
+                        kw = normalize_currency(kwota_str)
                         if kw != Decimal("0"):
                             return kw
                     except (ValueError, TypeError):
                         pass
+
+        # Fallback: tekst bez spacji (mBank)
+        for klucz in self.KLUCZE_SALDO:
+            klucz_clean = klucz.replace(" ", "")
+            # Szukaj OSTATNIEGO wystąpienia (saldo końcowe = na końcu dokumentu)
+            idx = tekst_no_space.rfind(klucz_clean)
+            if idx == -1:
+                continue
+            # Wyciągnij fragment po słowie kluczowym (do 50 znaków)
+            po_kluczu = tekst_no_space[idx + len(klucz_clean):idx + len(klucz_clean) + 50]
+            kwoty = self.RE_SALDO_KWOTA.findall(po_kluczu)
+            for kwota_str in kwoty:
+                try:
+                    kw = normalize_currency(kwota_str)
+                    if kw != Decimal("0"):
+                        return kw
+                except (ValueError, TypeError):
+                    pass
         return None
+
+    def _wykryj_okres_zestawienia(self, tekst: str) -> Tuple[Optional[int], Optional[int]]:
+        """
+        Wykrywa okres zestawienia z nagłówka dokumentu.
+        Szuka frazy "za okres od YYYY-MM-DD do YYYY-MM-DD" i zwraca rok/miesiąc
+        daty końcowej. To pewniejsze niż szukanie najpóźniejszej daty w tekście,
+        bo niektóre banki zawierają daty "przyszłe" (np. data kapitalizacji).
+        """
+        # Usuń spacje żeby radzić sobie z różnymi formatami
+        tekst_no_space = re.sub(r"\s+", "", tekst)
+        m = self.RE_OKRES.search(tekst_no_space)
+        if m:
+            try:
+                rok_do, mies_do = int(m.group(4)), int(m.group(5))
+                if 2000 <= rok_do <= 2100 and 1 <= mies_do <= 12:
+                    return rok_do, mies_do
+            except (ValueError, IndexError):
+                pass
+        return None, None
 
     def _iban(self, tekst: str) -> str:
         m = self.WZORZEC_IBAN.search(tekst)
@@ -1046,7 +1132,7 @@ class SymfoniaYearEndAuditor:
             linia,
             f"  RAPORT KONTROLI JAKOŚCI DANYCH – ZAMKNIĘCIE ROKU {rok}",
             f"  Podmiot: {nazwa_podmiotu}",
-            f"  Wygenerowano przez: SymfoniaYearEndAuditor v3.2",
+            f"  Wygenerowano przez: SymfoniaYearEndAuditor v3.3",
             linia, "",
             f"{'ŹRÓDŁO':<14} {'STATUS':<20} {'PUNKT KONTROLI':<42} UWAGI",
             "─" * 110,
@@ -2187,5 +2273,3 @@ def pobierz_dane_krs(numer_krs: str, timeout_sec: int = 15) -> DaneKRS:
 # =============================================================================
 # Ten plik jest modułem biblioteki – nie powinien być uruchamiany bezpośrednio.
 # Aplikacja Streamlit (app.py) importuje z niego klasy i funkcje.
-
-
