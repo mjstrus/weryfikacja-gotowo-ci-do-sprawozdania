@@ -21,6 +21,7 @@ from symfonia_year_end_auditor import (
     DaneBilansu,
     DaneRZiS,
     DaneKRS,
+    SumyRazemZOiS,
     WyciagBankowy,
     MIESIACE_PL,
     normalize_currency,
@@ -234,10 +235,17 @@ with st.sidebar:
     )
     st.session_state["nazwa_podmiotu"] = nazwa_podmiotu
 
+    # Rok obrachunkowy – domyślnie poprzedni rok (za który robi się sprawozdanie).
+    # Oferujemy 5 lat wstecz, żeby można było robić audyty historyczne.
+    from datetime import date as _date
+    rok_biezacy = _date.today().year
+    dostepne_lata = list(range(rok_biezacy, rok_biezacy - 6, -1))
     rok = st.selectbox(
         "Rok obrachunkowy",
-        options=[2024, 2023, 2022],
-        index=0, key="input_rok",
+        options=dostepne_lata,
+        index=1,  # domyślnie rok_biezacy - 1 (np. 2025 gdy jesteśmy w 2026)
+        key="input_rok",
+        help="Rok za który przeprowadzany jest audyt. Domyślnie rok poprzedni.",
     )
     st.session_state["rok"] = rok
 
@@ -363,7 +371,8 @@ if st.session_state["etap"] == 1:
 
         tryb_testowy = st.checkbox(
             "🧪 Tryb testowy (dane syntetyczne)",
-            help="3 rachunki bankowe: Santander (grudzień), mBank (kwiecień), PKO (bez wyciągu)."
+            help=("Pełny zestaw spójnych danych: 3 rachunki bankowe (2 w grudniu, "
+                  "1 bez wyciągu), kompletne konta wynikowe, Suma razem Wn=Ma.")
         )
 
         if st.button(
@@ -376,7 +385,14 @@ if st.session_state["etap"] == 1:
 
             try:
                 if tryb_testowy:
-                    # Dane testowe z 3 rachunkami
+                    # ═══ Spójne dane testowe ═══════════════════════════════
+                    # Cała matematyka:
+                    #   Grupa 70 (Ma)  = 210.000 = RZiS A ✓
+                    #   Grupa 4  (Wn)  = 145.000 = RZiS B ✓
+                    #   Wynik netto    = 45.000 = Bilans A.VI = RZiS L
+                    #   860 saldo Ma   = 45.000 (przed zamknięciem)
+                    #   Aktywa = Pasywa = 350.000
+                    #   Obroty: BO Wn=Ma, miesiąc Wn=Ma, narastająco Wn=Ma
                     dz = DaneZOiS()
                     dz.konta_analityki = {
                         "130-1": (Decimal("125000.00"), Decimal("0")),
@@ -384,17 +400,64 @@ if st.session_state["etap"] == 1:
                         "130-3": (Decimal("18000.00"),  Decimal("0")),
                     }
                     dz.konta = {
+                        # Rachunki bankowe (łącznie 146.500)
                         "130":  (Decimal("146500.00"), Decimal("0")),
                         "145":  (Decimal("0"),         Decimal("0")),
+                        # Rozrachunki handlowe
                         "200":  (Decimal("12000.00"),  Decimal("0")),
                         "202":  (Decimal("0"),         Decimal("8750.00")),
-                        "400":  (Decimal("45000.00"),  Decimal("0")),
+                        # Zobowiązania publiczno-prawne
+                        "220":  (Decimal("0"),         Decimal("3200.00")),  # PIT
+                        "229":  (Decimal("0"),         Decimal("4500.00")),  # ZUS
+                        # Rozliczenia z pracownikami
+                        "230":  (Decimal("0"),         Decimal("6800.00")),
+                        # Kapitał zakładowy (5 tys. – spójne z KRS)
+                        "801":  (Decimal("0"),         Decimal("5000.00")),
+                        # Koszty (grupa 4) – suma 145.000 = RZiS poz. B
+                        "400":  (Decimal("25000.00"),  Decimal("0")),  # materiały
+                        "401":  (Decimal("60000.00"),  Decimal("0")),  # usługi obce
+                        "402":  (Decimal("45000.00"),  Decimal("0")),  # wynagrodzenia
+                        "403":  (Decimal("12000.00"),  Decimal("0")),  # ZUS-y
+                        "405":  (Decimal("3000.00"),   Decimal("0")),  # amortyzacja
+                        # Przychody (grupa 70) = 210.000 = RZiS poz. A
                         "700":  (Decimal("0"),         Decimal("210000.00")),
+                        # Konto wynikowe 860 – stan "przed zamknięciem": saldo Ma=wynik netto
+                        "860":  (Decimal("0"),         Decimal("45000.00")),
                     }
                     dz.opisy = {
-                        "130-1": "Santander – rachunek główny",
-                        "130-2": "mBank – rachunek pomocniczy",
+                        "130-1": "mBank – rachunek główny",
+                        "130-2": "Santander – rachunek pomocniczy",
                         "130-3": "PKO BP – rachunek walutowy USD",
+                        "145":   "Środki pieniężne w drodze",
+                        "200":   "Rozrachunki z odbiorcami",
+                        "202":   "Rozrachunki z dostawcami",
+                        "220":   "Podatki i opłaty (PIT)",
+                        "229":   "Rozliczenia ZUS",
+                        "230":   "Rozrachunki z pracownikami",
+                        "400":   "Zużycie materiałów",
+                        "401":   "Usługi obce",
+                        "402":   "Wynagrodzenia",
+                        "403":   "Ubezpieczenia społeczne",
+                        "405":   "Amortyzacja",
+                        "700":   "Przychody ze sprzedaży",
+                        "801":   "Kapitał zakładowy",
+                        "860":   "Wynik finansowy",
+                    }
+                    # Suma razem – wszystkie pary zbilansowane Wn=Ma
+                    dz.sumy_razem = SumyRazemZOiS(
+                        bo_wn=Decimal("250000.00"),
+                        bo_ma=Decimal("250000.00"),
+                        obroty_wn=Decimal("425000.00"),
+                        obroty_ma=Decimal("425000.00"),
+                        narastajaco_wn=Decimal("675000.00"),
+                        narastajaco_ma=Decimal("675000.00"),
+                        saldo_wn=Decimal("278250.00"),
+                        saldo_ma=Decimal("278250.00"),
+                        wykryto=True,
+                    )
+                    # Obroty narastająco dla 860 (by weryfikacja stanu "przed zamknięciem" działała)
+                    dz.obroty_narastajaco = {
+                        "860": (Decimal("0"), Decimal("45000.00")),
                     }
                     st.session_state["dane_zois"] = dz
                     st.session_state["dane_bilans"] = DaneBilansu(
@@ -415,7 +478,16 @@ if st.session_state["etap"] == 1:
                         podatek_dochodowy=(Decimal("20000.00"), Decimal("15000.00")),
                         zysk_netto=(Decimal("45000.00"), Decimal("45000.00")),
                     )
-                    st.session_state["dane_krs"] = None
+                    # Mock KRS spójny z kontem 801
+                    st.session_state["dane_krs"] = DaneKRS(
+                        numer_krs="0000000001",
+                        nazwa="FIRMA TESTOWA SP. Z O.O.",
+                        forma_prawna="SP. Z O.O.",
+                        nip="1234567890",
+                        regon="123456789",
+                        kapital_zakladowy=Decimal("5000.00"),
+                        data_pobrania="dane testowe",
+                    )
                     st.session_state["tryb_testowy"] = True
                 else:
                     # Parsowanie prawdziwego ZOiS
