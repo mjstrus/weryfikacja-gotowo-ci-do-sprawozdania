@@ -160,6 +160,30 @@ class DaneKRS:
 
 
 @dataclass
+class DaneDRA:
+    """
+    Dane z deklaracji rozliczeniowej ZUS DRA (miesięczna).
+    Parsowane z PDF eksportowanego z programu Płatnik.
+
+    Najważniejsze pole: `kwota_do_zaplaty` (pozycja IX.02) – suma wszystkich
+    składek do zapłaty za dany miesiąc. Porównujemy to z saldem Ma konta
+    rozpoznanego jako ZUS w ZOiS (zwykle 229 lub 220-3).
+    """
+    nip:                 str = ""
+    regon:               str = ""
+    nazwa:               str = ""
+    rok:                 Optional[int] = None
+    miesiac:             Optional[int] = None
+    kwota_do_zaplaty:    Decimal = Decimal("0")   # IX.02 – łączna kwota
+    # Rozbicie (opcjonalnie – do informacyjnego wyświetlenia):
+    skladki_spoleczne:   Decimal = Decimal("0")   # IV.07
+    skladki_zdrowotne:   Decimal = Decimal("0")   # VI.07
+    skladki_fp_fgsp:     Decimal = Decimal("0")   # VII.03
+    skladki_fep:         Decimal = Decimal("0")   # VIII.03
+    blad:                Optional[str] = None
+
+
+@dataclass
 class DaneZOiS:
     """
     Zestawienie Obrotów i Sald z Symfonii – syntetyki + analityki.
@@ -1309,6 +1333,7 @@ class SymfoniaYearEndAuditor:
         dane_bilans: Optional[DaneBilansu]  = None,
         dane_rzis:   Optional[DaneRZiS]     = None,
         dane_krs:    Optional[DaneKRS]      = None,
+        dane_dra:    Optional["DaneDRA"]    = None,
         wyciagi:     Optional[List[WyciagBankowy]] = None,
         rok_obrachunkowy: int = 2024,
     ) -> List[PunktKontroli]:
@@ -1349,6 +1374,10 @@ class SymfoniaYearEndAuditor:
         if dane_krs is not None:
             self._weryfikuj_krs(dane_zois, dane_bilans, dane_krs)
 
+        # ── R4: Weryfikacja DRA ↔ ZOiS (zobowiązanie ZUS) ──────────────────
+        if dane_dra is not None:
+            self._weryfikuj_dra(dane_zois, dane_dra, rok_obrachunkowy)
+
         return self._wyniki
 
     def generate_audit_report(
@@ -1362,7 +1391,7 @@ class SymfoniaYearEndAuditor:
             linia,
             f"  RAPORT KONTROLI JAKOŚCI DANYCH – ZAMKNIĘCIE ROKU {rok}",
             f"  Podmiot: {nazwa_podmiotu}",
-            f"  Wygenerowano przez: SymfoniaYearEndAuditor v3.3",
+            f"  Wygenerowano przez: SymfoniaYearEndAuditor v3.5",
             linia, "",
             f"{'ŹRÓDŁO':<14} {'STATUS':<20} {'PUNKT KONTROLI':<42} UWAGI",
             "─" * 110,
@@ -2529,10 +2558,330 @@ class SymfoniaYearEndAuditor:
         # TODO (opcjonalnie): porównanie z nazwą z nagłówka Bilansu/RZiS
         # Na razie tylko wyświetlamy nazwę z KRS jako INFO.
 
+    # ─── R4: WERYFIKACJA DRA ↔ ZOiS (v3.5) ───────────────────────────────────
+
+    def _weryfikuj_dra(
+        self,
+        dane_zois: Optional[DaneZOiS],
+        dane_dra:  "DaneDRA",
+        rok_obrachunkowy: int,
+    ):
+        """
+        Weryfikuje zgodność kwoty do zapłaty z DRA (za ostatni miesiąc roku)
+        z saldem Ma konta rozpoznanego jako ZUS w ZOiS (np. 229 lub 220-3).
+
+        Standardowy scenariusz: DRA za grudzień = saldo zobowiązania ZUS w ZOiS
+        na 31.12, bo zobowiązanie grudniowe jest zapłacone dopiero w styczniu
+        następnego roku.
+        """
+        # Jeśli błąd parsowania – pokaż info i zakończ
+        if dane_dra.blad:
+            self._wyniki.append(PunktKontroli(
+                konto="DRA", punkt="Parsowanie deklaracji DRA",
+                status=StatusAudytu.BRAK,
+                uwagi=f"Nie udało się sparsować DRA: {dane_dra.blad}",
+            ))
+            return
+
+        # ── Info o wczytanej DRA ────────────────────────────────────────────
+        okres_str = (
+            f"{dane_dra.miesiac:02d}/{dane_dra.rok}" if dane_dra.miesiac and dane_dra.rok
+            else "okres nieznany"
+        )
+        rozbicie = []
+        if dane_dra.skladki_spoleczne > Decimal("0"):
+            rozbicie.append(f"społ.={dane_dra.skladki_spoleczne:,.2f}")
+        if dane_dra.skladki_zdrowotne > Decimal("0"):
+            rozbicie.append(f"zdrow.={dane_dra.skladki_zdrowotne:,.2f}")
+        if dane_dra.skladki_fp_fgsp > Decimal("0"):
+            rozbicie.append(f"FP/FGŚP={dane_dra.skladki_fp_fgsp:,.2f}")
+        if dane_dra.skladki_fep > Decimal("0"):
+            rozbicie.append(f"FEP={dane_dra.skladki_fep:,.2f}")
+        rozbicie_str = f" ({', '.join(rozbicie)})" if rozbicie else ""
+
+        self._wyniki.append(PunktKontroli(
+            konto="DRA",
+            punkt=f"Deklaracja DRA za {okres_str}",
+            status=StatusAudytu.INFO,
+            uwagi=(f"Płatnik: {dane_dra.nazwa} (NIP {dane_dra.nip}). "
+                   f"Kwota do zapłaty (IX.02): {dane_dra.kwota_do_zaplaty:,.2f} zł"
+                   f"{rozbicie_str}."),
+        ))
+
+        # ── Ostrzeżenie gdy DRA dotyczy innego miesiąca niż grudzień ──────
+        if dane_dra.miesiac and dane_dra.miesiac != 12:
+            self._wyniki.append(PunktKontroli(
+                konto="DRA",
+                punkt=f"Miesiąc DRA ({dane_dra.miesiac}/{dane_dra.rok})",
+                status=StatusAudytu.OSTRZEZ,
+                uwagi=("DRA dotyczy miesiąca innego niż grudzień. Do weryfikacji "
+                       "zobowiązania ZUS na koniec roku zwykle potrzebna jest DRA "
+                       "za grudzień."),
+            ))
+
+        # ── Ostrzeżenie gdy rok DRA != rok obrachunkowy ───────────────────
+        if dane_dra.rok and dane_dra.rok != rok_obrachunkowy:
+            self._wyniki.append(PunktKontroli(
+                konto="DRA",
+                punkt="Rok DRA",
+                status=StatusAudytu.OSTRZEZ,
+                uwagi=(f"Rok DRA ({dane_dra.rok}) nie zgadza się z rokiem "
+                       f"obrachunkowym ({rok_obrachunkowy})."),
+            ))
+
+        # ── Weryfikacja NIP vs dane z ZOiS (jeśli KRS był pobrany) ──────
+        # (pomijamy – nie mamy NIP-u z ZOiS, KRS byłby opcjonalny)
+
+        # ── Porównanie kwoty DRA z saldem Ma konta ZUS w ZOiS ──────────────
+        if dane_zois is None:
+            self._wyniki.append(PunktKontroli(
+                konto="DRA↔ZOiS",
+                punkt="Porównanie DRA z saldem ZUS",
+                status=StatusAudytu.BRAK,
+                uwagi="Brak ZOiS – nie można porównać DRA z saldem konta ZUS.",
+            ))
+            return
+
+        # Znajdź konta rozpoznane jako ZUS (po opisie "zus" lub "ubezpieczen")
+        konta_zus: List[Tuple[str, Decimal, str]] = []  # (konto, saldo_ma, opis)
+        for numer, opis in dane_zois.opisy.items():
+            opis_lower = opis.lower()
+            if ("zus" in opis_lower or "ubezpieczen" in opis_lower
+                    or "ubezpieczeń" in opis_lower):
+                # Wyklucz konta kosztowe grupy 4 (np. 403 "Ubezpieczenia społeczne")
+                if numer.split("-")[0].startswith("4"):
+                    continue
+                para = (dane_zois.konta.get(numer) if "-" not in numer
+                        else dane_zois.konta_analityki.get(numer))
+                if para:
+                    wn, ma = para
+                    saldo_ma = ma - wn  # dodatni = zobowiązanie
+                    konta_zus.append((numer, saldo_ma, opis))
+
+        if not konta_zus:
+            self._wyniki.append(PunktKontroli(
+                konto="DRA↔ZOiS",
+                punkt="Porównanie DRA z saldem ZUS",
+                status=StatusAudytu.BRAK,
+                uwagi=("Nie znaleziono w ZOiS konta rozpoznanego jako ZUS "
+                       "(szukano opisów z 'zus' lub 'ubezpieczen')."),
+            ))
+            return
+
+        # Sumujemy salda wszystkich kont ZUS
+        saldo_zus_zois = sum((s for _, s, _ in konta_zus), Decimal("0"))
+        kwota_dra = dane_dra.kwota_do_zaplaty
+        opisy_kont = ", ".join(f"{n} ({s:,.2f})" for n, s, _ in konta_zus)
+
+        TOL = Decimal("1.00")
+        roznica = abs(saldo_zus_zois - kwota_dra)
+
+        if roznica <= TOL:
+            self._wyniki.append(PunktKontroli(
+                konto="DRA↔ZOiS",
+                punkt="Zobowiązanie ZUS: DRA = saldo Ma w ZOiS",
+                status=StatusAudytu.OK,
+                uwagi=(f"Zgodne: DRA={kwota_dra:,.2f} zł = "
+                       f"ZOiS {opisy_kont}."),
+            ))
+        else:
+            self._wyniki.append(PunktKontroli(
+                konto="DRA↔ZOiS",
+                punkt="Zobowiązanie ZUS: DRA = saldo Ma w ZOiS",
+                status=StatusAudytu.OSTRZEZ,
+                uwagi=(f"ROZBIEŻNOŚĆ: DRA={kwota_dra:,.2f} zł, "
+                       f"ZOiS (suma kont ZUS)={saldo_zus_zois:,.2f} zł | "
+                       f"Δ={roznica:,.2f} zł. Rozbicie: {opisy_kont}. "
+                       "Możliwe przyczyny: niezaksięgowana DRA, inne "
+                       "miesiące niezapłacone, odsetki, korekty."),
+            ))
+
 
 # =============================================================================
-# INTEGRACJA Z API KRS (v3.2)
+# PARSER DEKLARACJI ROZLICZENIOWEJ ZUS DRA (v3.5)
 # =============================================================================
+
+def parsuj_dra(dane_binarne: bytes) -> DaneDRA:
+    """
+    Parsuje PDF deklaracji rozliczeniowej ZUS DRA (generowany przez Płatnik).
+
+    Wyciąga:
+        - Nazwa, NIP, REGON płatnika
+        - Okres deklaracji (rok + miesiąc z pozycji I.02 "ID DEKLARACJI")
+        - Łączna kwota do zapłaty (pozycja IX.02)
+        - Rozbicie na fundusze (IV.07, VI.07, VII.03, VIII.03) – informacyjnie
+
+    Args:
+        dane_binarne: PDF w formacie bytes
+
+    Returns:
+        DaneDRA: dane z wypełnionymi polami lub DaneDRA z polem `blad`
+                 przy niepowodzeniu parsowania.
+    """
+    if not PDF_AVAILABLE:
+        return DaneDRA(blad="Brak biblioteki pdfplumber do parsowania PDF.")
+
+    try:
+        bufor = io.BytesIO(dane_binarne)
+        caly_tekst = ""
+        with pdfplumber.open(bufor) as pdf:
+            for strona in pdf.pages:
+                caly_tekst += (strona.extract_text() or "") + "\n"
+    except Exception as e:
+        return DaneDRA(blad=f"Błąd odczytu PDF: {e}")
+
+    if not caly_tekst.strip():
+        return DaneDRA(blad="PDF jest pusty lub nie udało się ekstraktować tekstu.")
+
+    # Sprawdź czy to w ogóle DRA
+    if "DEKLARACJA ROZLICZENIOWA" not in caly_tekst.upper() and "ZUS" not in caly_tekst.upper():
+        return DaneDRA(blad="Plik nie wygląda na deklarację ZUS DRA.")
+
+    wynik = DaneDRA()
+    linie = caly_tekst.splitlines()
+
+    # ── NIP ────────────────────────────────────────────────────────────────
+    m = re.search(r"NUMER\s+NIP\s+(\d{10})", caly_tekst)
+    if m:
+        wynik.nip = m.group(1)
+
+    # ── REGON ──────────────────────────────────────────────────────────────
+    m = re.search(r"NUMER\s+REGON\s+(\d{9,14})", caly_tekst)
+    if m:
+        wynik.regon = m.group(1)[:9]
+
+    # ── Nazwa skrócona (linia zawierająca "NAZWA SKRÓCONA") ───────────────
+    for linia in linie:
+        if "NAZWA SKRÓCONA" in linia:
+            m = re.search(r"NAZWA SKRÓCONA\s+(.+?)(?:\s+07\.|$)", linia)
+            if m:
+                wynik.nazwa = m.group(1).strip()
+            break
+
+    # ── Okres (I.02 ID DEKLARACJI – format "NN MM.YYYY" lub "NN MM YYYY") ──
+    m = re.search(
+        r"ID\s+DEKLARACJI\s+(?:\d{1,2}\s+)?(\d{2})[\s.](\d{4})",
+        caly_tekst,
+    )
+    if m:
+        try:
+            mies = int(m.group(1))
+            rok = int(m.group(2))
+            if 1 <= mies <= 12 and 2000 <= rok <= 2100:
+                wynik.miesiac = mies
+                wynik.rok = rok
+        except ValueError:
+            pass
+
+    # ── Łączna kwota do zapłaty (IX.02) ─────────────────────────────────────
+    # Format PDF: po nagłówku "IX. ZESTAWIENIE NALEŻNYCH SKŁADEK DO ZWROTU/ ZAPŁATY"
+    # linia z samą kwotą (np. "630,00"), potem linia "01. KWOTA DO ZWROTU..."
+    for i, linia in enumerate(linie):
+        if re.search(r"IX\.\s+ZESTAWIENIE", linia):
+            # Szukamy w kolejnych 3 liniach kwoty liczbowej
+            for j in range(i + 1, min(i + 5, len(linie))):
+                kandydat = linie[j].strip()
+                # Linia zawierająca samą kwotę "630,00" lub "1 260,00"
+                m_kwota = re.match(r"^\s*(\d{1,3}(?:\s\d{3})*,\d{2})\s*$", kandydat)
+                if m_kwota:
+                    try:
+                        wynik.kwota_do_zaplaty = normalize_currency(m_kwota.group(1))
+                    except ValueError:
+                        pass
+                    break
+                # Alternatywnie linia "01. KWOTA ... KWOTA DO ZAPŁATY 630,00"
+                m_kwota2 = re.search(r"KWOTA\s+DO\s+ZAP[ŁL]ATY\s+(\d{1,3}(?:\s\d{3})*,\d{2})", kandydat)
+                if m_kwota2:
+                    try:
+                        wynik.kwota_do_zaplaty = normalize_currency(m_kwota2.group(1))
+                    except ValueError:
+                        pass
+                    break
+            break
+
+    # ── IV.07 – składki społeczne ───────────────────────────────────────────
+    m = re.search(
+        r"07\.\s+KWOTA\s+SK[ŁL]ADEK\s+NA\s+UBEZPIECZENIA\s+SPO[ŁL]ECZNE"
+        r".+?(\d+(?:\s\d{3})*,\d{2})",
+        caly_tekst,
+        re.DOTALL,
+    )
+    if m:
+        try:
+            wynik.skladki_spoleczne = normalize_currency(m.group(1))
+        except ValueError:
+            pass
+
+    # ── VI.07 – składki zdrowotne (KWOTA DO ZAPŁATY w sekcji zdrowotnej) ────
+    # Szukamy wystąpienia "07. KWOTA DO ZAPŁATY <kwota>" między "VI." a "VII."
+    m_sekcja = re.search(
+        r"VI\.\s+ZESTAWIENIE.+?(?=VII\.\s+ZESTAWIENIE|$)",
+        caly_tekst,
+        re.DOTALL,
+    )
+    if m_sekcja:
+        m = re.search(
+            r"07\.\s+KWOTA\s+DO\s+ZAP[ŁL]ATY\s+(\d+(?:\s\d{3})*,\d{2})",
+            m_sekcja.group(0),
+        )
+        if m:
+            try:
+                wynik.skladki_zdrowotne = normalize_currency(m.group(1))
+            except ValueError:
+                pass
+
+    # ── VII.03 – FP i FGŚP ──────────────────────────────────────────────────
+    m_sekcja = re.search(
+        r"VII\.\s+ZESTAWIENIE.+?(?=VIII\.\s+ZESTAWIENIE|$)",
+        caly_tekst,
+        re.DOTALL,
+    )
+    if m_sekcja:
+        m = re.search(
+            r"03\.\s+KWOTA\s+DO\s+ZAP[ŁL]ATY\s+(\d+(?:\s\d{3})*,\d{2})",
+            m_sekcja.group(0),
+        )
+        if m:
+            try:
+                wynik.skladki_fp_fgsp = normalize_currency(m.group(1))
+            except ValueError:
+                pass
+
+    # ── VIII.03 – FEP ──────────────────────────────────────────────────────
+    m_sekcja = re.search(
+        r"VIII\.\s+ZESTAWIENIE.+?(?=IX\.\s+ZESTAWIENIE|$)",
+        caly_tekst,
+        re.DOTALL,
+    )
+    if m_sekcja:
+        m = re.search(
+            r"03\.\s+SUMA\s+NALE[ŻZ]NYCH\s+SK[ŁL]ADEK\s+NA\s+FEP\s+(\d+(?:\s\d{3})*,\d{2})",
+            m_sekcja.group(0),
+        )
+        if m:
+            try:
+                wynik.skladki_fep = normalize_currency(m.group(1))
+            except ValueError:
+                pass
+
+    # ── Walidacja: jeśli nie wyciągnęliśmy kwoty głównej – błąd ─────────────
+    if wynik.kwota_do_zaplaty == Decimal("0") and all(
+        v == Decimal("0") for v in [
+            wynik.skladki_spoleczne, wynik.skladki_zdrowotne,
+            wynik.skladki_fp_fgsp, wynik.skladki_fep,
+        ]
+    ):
+        # Wszystko 0 – możliwe że DRA zerowa, ale to podejrzane
+        logger.warning("Parser DRA: nie wyciągnięto żadnej kwoty – możliwa DRA zerowa.")
+
+    logger.info(
+        f"DRA: {wynik.nazwa} ({wynik.nip}) za {wynik.miesiac}/{wynik.rok} – "
+        f"do zapłaty: {wynik.kwota_do_zaplaty:,.2f} zł"
+    )
+    return wynik
+
+
+
 
 def pobierz_dane_krs(numer_krs: str, timeout_sec: int = 15) -> DaneKRS:
     """
